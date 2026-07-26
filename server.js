@@ -30,6 +30,7 @@ const galleryRouter = require('./routes/galleryRouter');
 const reportsRouter = require('./routes/reportsRouter');
 const analyticsRouter = require('./routes/analyticsRouter');
 const notificationRouter = require('./routes/notificationRouter');
+const pushRouter = require('./routes/pushRouter');
 
 app.use('/api', dataRouter);
 app.use('/api/newsletter-subscribers', newsletterSubscribersRouter);
@@ -37,6 +38,7 @@ app.use('/api/gallery', galleryRouter);
 app.use('/api/reports', reportsRouter);
 app.use('/api/analytics', analyticsRouter);
 app.use('/api/notifications', notificationRouter);
+app.use('/api/push', pushRouter);
 
 // Health check endpoint for deployment monitoring
 app.get('/health', (req, res) => {

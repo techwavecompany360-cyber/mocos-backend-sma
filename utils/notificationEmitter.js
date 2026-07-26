@@ -1,5 +1,19 @@
 const connectDB = require('./db');
 const { ObjectId } = require('mongodb');
+const webpush = require('web-push');
+const config = require('../config');
+
+// Configure web-push with VAPID keys
+if (config.VAPID_PUBLIC_KEY && config.VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    config.VAPID_SUBJECT,
+    config.VAPID_PUBLIC_KEY,
+    config.VAPID_PRIVATE_KEY
+  );
+  console.log('[Web Push] VAPID keys configured successfully');
+} else {
+  console.warn('[Web Push] VAPID keys not configured — Web Push notifications will be disabled');
+}
 
 let sseClients = [];
 
@@ -41,7 +55,67 @@ setInterval(() => {
 }, 25000);
 
 /**
- * Broadcast notification to all active SSE clients and save to DB
+ * Send Web Push to all stored subscriptions
+ */
+async function sendWebPushToAll(notification) {
+  if (!config.VAPID_PUBLIC_KEY || !config.VAPID_PRIVATE_KEY) {
+    return; // Web Push not configured
+  }
+
+  try {
+    const db = await connectDB();
+    const subscriptions = await db.collection('push_subscriptions').find().toArray();
+
+    if (subscriptions.length === 0) {
+      console.log('[Web Push] No subscriptions found, skipping push');
+      return;
+    }
+
+    const payload = JSON.stringify({
+      title: notification.title || 'MOCOS Notification',
+      body: notification.message || 'You have a new notification',
+      icon: '/logo.png',
+      badge: '/logo.png',
+      tag: notification.id || 'mocos-' + Date.now(),
+      data: {
+        link: notification.link || '/',
+        id: notification.id,
+        type: notification.type
+      }
+    });
+
+    console.log(`[Web Push] Sending push to ${subscriptions.length} subscription(s)`);
+
+    const results = await Promise.allSettled(
+      subscriptions.map(async (sub) => {
+        try {
+          await webpush.sendNotification(
+            { endpoint: sub.endpoint, keys: sub.keys },
+            payload
+          );
+        } catch (error) {
+          // If subscription is expired or invalid (410 Gone / 404), remove it
+          if (error.statusCode === 410 || error.statusCode === 404) {
+            console.log(`[Web Push] Removing expired subscription: ${sub.endpoint.substring(0, 50)}...`);
+            await db.collection('push_subscriptions').deleteOne({ endpoint: sub.endpoint });
+          } else {
+            console.error(`[Web Push] Error sending to ${sub.endpoint.substring(0, 50)}...:`, error.message);
+          }
+          throw error; // Re-throw so Promise.allSettled marks as rejected
+        }
+      })
+    );
+
+    const succeeded = results.filter(r => r.status === 'fulfilled').length;
+    const failed = results.filter(r => r.status === 'rejected').length;
+    console.log(`[Web Push] Results: ${succeeded} delivered, ${failed} failed`);
+  } catch (error) {
+    console.error('[Web Push] Error in sendWebPushToAll:', error.message);
+  }
+}
+
+/**
+ * Broadcast notification to all active SSE clients, save to DB, and send Web Push
  */
 async function broadcastNotification(payload) {
   try {
@@ -62,7 +136,7 @@ async function broadcastNotification(payload) {
 
     console.log(`[Notification SSE] Broadcasting notification "${notification.title}" to ${sseClients.length} clients`);
 
-    // Broadcast to connected SSE clients
+    // Broadcast to connected SSE clients (for in-app real-time updates)
     const sseData = `data: ${JSON.stringify(notification)}\n\n`;
     sseClients.forEach((c) => {
       try {
@@ -71,6 +145,9 @@ async function broadcastNotification(payload) {
         console.error(`[Notification SSE] Error writing to client ${c.id}:`, err.message);
       }
     });
+
+    // Send Web Push notifications (for when browser is closed)
+    sendWebPushToAll(notification);
 
     return notification;
   } catch (error) {
