@@ -2,6 +2,9 @@ const connectDB = require('./db');
 const { ObjectId } = require('mongodb');
 const webpush = require('web-push');
 const config = require('../config');
+const { sendAPNsToAll } = require('./apnsService');
+const { sendAdminUpdateEmail } = require('./emailService');
+
 
 // Configure web-push with VAPID keys
 if (config.VAPID_PUBLIC_KEY && config.VAPID_PRIVATE_KEY) {
@@ -149,11 +152,20 @@ async function broadcastNotification(payload) {
     // Send Web Push notifications (for when browser is closed)
     sendWebPushToAll(notification);
 
+    // Send APNs Push notifications (for native iOS app)
+    sendAPNsToAll(notification);
+
+    // Send Email Update to Admin recipient via updates@mocos.co.tz
+    sendAdminUpdateEmail(notification).catch(err => {
+      console.error('[Email Notification] Error sending admin update email:', err.message);
+    });
+
     return notification;
   } catch (error) {
     console.error('[Notification SSE] Error broadcasting notification:', error.message);
   }
 }
+
 
 module.exports = {
   addClient,

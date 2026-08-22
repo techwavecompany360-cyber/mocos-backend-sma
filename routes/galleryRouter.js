@@ -8,6 +8,8 @@ const jwt = require('jsonwebtoken');
 
 const config = require('../config');
 
+const gcsStorage = require('../utils/gcsStorage');
+
 const router = express.Router();
 const JWT_SECRET = config.JWT_SECRET;
 
@@ -23,17 +25,8 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// Set up multer for file uploads
-const uploadDir = path.join(__dirname, '../public/gallery');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}-${Math.round(Math.random()*1e9)}${ext}`);
-  }
-});
-// Allow up to 30MB image file size
+// Set up multer with memory storage
+const storage = multer.memoryStorage();
 const upload = multer({ storage, limits: { fileSize: 30 * 1024 * 1024 } });
 
 // POST /api/gallery - upload image
@@ -42,8 +35,10 @@ router.post('/', authenticateToken, upload.single('image'), async (req, res) => 
     if (!req.file) return res.status(400).json({ error: 'Image file is required' });
     const db = await connectDB();
     const alt = req.body.alt || '';
-    const url = `/gallery/${req.file.filename}`;
-    const doc = { url, alt };
+    const filename = gcsStorage.generateFilename('gallery', req.file.originalname);
+    const destPath = `gallery/${filename}`;
+    const url = await gcsStorage.uploadFile(req.file.buffer, destPath, req.file.mimetype);
+    const doc = { url, alt, gcsPath: destPath };
     const result = await db.collection('gallery').insertOne(doc);
     res.status(201).json({ id: result.insertedId.toString(), url, alt });
   } catch (error) {
@@ -70,9 +65,10 @@ router.delete('/:id', authenticateToken, async (req, res) => {
     if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid image id' });
     const image = await db.collection('gallery').findOne({ _id: new ObjectId(id) });
     if (!image) return res.status(404).json({ error: 'Image not found' });
-    // Remove file
-    const filePath = path.join(uploadDir, path.basename(image.url));
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    
+    const gcsPath = image.gcsPath || (image.url && image.url.startsWith('http') ? gcsStorage.extractGcsPath(image.url) : `gallery/${path.basename(image.url)}`);
+    if (gcsPath) await gcsStorage.deleteFile(gcsPath);
+
     await db.collection('gallery').deleteOne({ _id: new ObjectId(id) });
     res.json({ success: true });
   } catch (error) {

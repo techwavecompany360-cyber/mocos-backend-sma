@@ -18,6 +18,7 @@ router.get("/device-reports", async (req, res) => {
     const repairs = await db.collection("repairData").find().toArray();
     const sells = await db.collection("sellData").find().toArray();
     const serviceCards = await db.collection("service_cards").find().toArray();
+    const serviceRequests = await db.collection("service_requests").find().toArray();
 
     const deviceReports = [];
 
@@ -74,6 +75,20 @@ router.get("/device-reports", async (req, res) => {
       });
     });
 
+    serviceRequests.forEach((sr) => {
+      const model = `${sr.deviceInfo?.brandName || sr.deviceInfo?.make || ""} ${sr.deviceInfo?.model || ""}`.trim();
+      deviceReports.push({
+        id: sr._id.toString(),
+        deviceModel: model || sr.deviceInfo?.deviceType || "Unknown Device",
+        customerName: sr.customerInfo?.fullName || "Unknown Customer",
+        customerPhone: sr.customerInfo?.phoneNumber || "",
+        issue: sr.deviceInfo?.problemDescription || sr.diagnosis?.faultDescription || "Service Request",
+        source: sr.escalation?.isEscalated ? "Escalated Network Job" : "Service Request",
+        status: sr.status || "Pending",
+        dateReceived: sr.createdAt || new Date(),
+      });
+    });
+
     // Sort by date received descending
     deviceReports.sort((a, b) => new Date(b.dateReceived) - new Date(a.dateReceived));
 
@@ -91,6 +106,7 @@ router.get("/customer-reports", async (req, res) => {
     const repairs = await db.collection("repairData").find().toArray();
     const sells = await db.collection("sellData").find().toArray();
     const serviceCards = await db.collection("service_cards").find().toArray();
+    const serviceRequests = await db.collection("service_requests").find().toArray();
 
     const customersMap = new Map();
 
@@ -107,11 +123,11 @@ router.get("/customer-reports", async (req, res) => {
         repairsCount: 0,
         sellsCount: 0,
         serviceCardsCount: 0,
+        serviceRequestsCount: 0,
         lastVisit: date,
         status: "Active"
       };
 
-      // Keep the most detailed fields
       if (name && (!existing.fullName || existing.fullName === "Unknown")) existing.fullName = name;
       if (phone && !existing.phone) existing.phone = phone;
       if (email && !existing.email) existing.email = email;
@@ -125,6 +141,7 @@ router.get("/customer-reports", async (req, res) => {
       if (type === "repair") existing.repairsCount++;
       if (type === "sell") existing.sellsCount++;
       if (type === "service-card") existing.serviceCardsCount++;
+      if (type === "service-request") existing.serviceRequestsCount = (existing.serviceRequestsCount || 0) + 1;
 
       if (date && (!existing.lastVisit || new Date(date) > new Date(existing.lastVisit))) {
         existing.lastVisit = date;
@@ -137,6 +154,7 @@ router.get("/customer-reports", async (req, res) => {
     repairs.forEach((r) => processCustomer(r.remoteName, r.remotePhone, null, r.remoteRegion, r.remoteDistrict, "repair", r.submittedAt));
     sells.forEach((s) => processCustomer(s.name, s.phone, null, s.region, s.district, "sell", s.submittedAt));
     serviceCards.forEach((c) => processCustomer(c.customerInfo?.fullName, c.customerInfo?.phoneNumber, c.customerInfo?.email, null, null, "service-card", c.createdAt));
+    serviceRequests.forEach((sr) => processCustomer(sr.customerInfo?.fullName, sr.customerInfo?.phoneNumber, sr.customerInfo?.email, sr.customerInfo?.region, sr.customerInfo?.district, "service-request", sr.createdAt));
 
     const customersList = Array.from(customersMap.values());
     customersList.sort((a, b) => new Date(b.lastVisit || 0) - new Date(a.lastVisit || 0));
@@ -154,7 +172,6 @@ router.get("/spare-cost-reports", async (req, res) => {
     const spares = await db.collection("spare_cost_reports").find().toArray();
     const mappedSpares = spares.map((s) => ({ id: s._id.toString(), ...s, _id: undefined }));
 
-    // Fetch service cards and extract spare costs
     const serviceCards = await db.collection("service_cards").find().toArray();
     serviceCards.forEach((card) => {
       const cardDate = card.createdAt
@@ -193,6 +210,44 @@ router.get("/spare-cost-reports", async (req, res) => {
       }
     });
 
+    const serviceRequests = await db.collection("service_requests").find().toArray();
+    serviceRequests.forEach((sr) => {
+      const srDate = sr.createdAt
+        ? new Date(sr.createdAt).toISOString().split('T')[0]
+        : new Date().toISOString().split('T')[0];
+
+      const cards = sr.serviceCards || [];
+      cards.forEach((service, index) => {
+        if (service.spareCostExpense && Number(service.spareCostExpense) > 0) {
+          mappedSpares.push({
+            id: `${sr._id.toString()}-sr-spare-${index}`,
+            partName: `${service.fault || service.category || "Spare Part"} (Spare Expense)`,
+            deviceModel: `${sr.deviceInfo?.brandName || ""} ${sr.deviceInfo?.model || ""}`.trim() || "Unknown",
+            supplier: sr.partnerName || sr.branchName || "Service Request",
+            quantity: 1,
+            unitCost: Number(service.spareCostExpense),
+            status: "Used",
+            date: srDate,
+            linkedRequestInfo: `Service Request: ${sr.trackingId} (${sr.customerInfo?.fullName || "Customer"})`,
+          });
+        }
+      });
+
+      if (sr.repairExpense && Number(sr.repairExpense) > 0 && cards.length === 0) {
+        mappedSpares.push({
+          id: `${sr._id.toString()}-sr-repair-exp`,
+          partName: `Repair Expense (${sr.trackingId})`,
+          deviceModel: `${sr.deviceInfo?.brandName || ""} ${sr.deviceInfo?.model || ""}`.trim() || "Unknown",
+          supplier: sr.partnerName || sr.branchName || "Service Request",
+          quantity: 1,
+          unitCost: Number(sr.repairExpense),
+          status: "Used",
+          date: srDate,
+          linkedRequestInfo: `Service Request: ${sr.trackingId} (${sr.customerInfo?.fullName || "Customer"})`,
+        });
+      }
+    });
+
     // Sort by date descending
     mappedSpares.sort((a, b) => new Date(b.date) - new Date(a.date));
 
@@ -218,7 +273,6 @@ router.delete("/spare-cost-reports/:id", async (req, res) => {
     const db = await connectDB();
     const id = req.params.id;
 
-    // Handle dynamic service card spares deletion
     if (id.includes("-spare-") || id.includes("-service-exp-")) {
       const parts = id.split("-");
       const cardId = parts[0];
@@ -256,7 +310,6 @@ router.get("/repair-cost-reports", async (req, res) => {
     const repairs = await db.collection("repair_cost_reports").find().toArray();
     const mappedRepairs = repairs.map((r) => ({ id: r._id.toString(), ...r, _id: undefined }));
 
-    // Fetch service cards and extract service costs
     const serviceCards = await db.collection("service_cards").find().toArray();
     serviceCards.forEach((card) => {
       const cardDate = card.createdAt
@@ -275,12 +328,49 @@ router.get("/repair-cost-reports", async (req, res) => {
               source: "Service Card",
               laborCost: Number(service.serviceCost),
               partsCost: Number(service.spareCost || 0),
+              adminFee: 0,
               paymentStatus: "Paid",
               date: cardDate,
               notes: "Auto-generated from Service Card",
               linkedRequestInfo: "Service Card",
             });
           }
+        });
+      }
+    });
+
+    const serviceRequests = await db.collection("service_requests").find().toArray();
+    serviceRequests.forEach((sr) => {
+      const srDate = sr.createdAt
+        ? new Date(sr.createdAt).toISOString().split('T')[0]
+        : new Date().toISOString().split('T')[0];
+
+      const totalCost = Number(sr.totalCost || 0);
+      const adminFee = Number(sr.escalation?.adminFee || 0);
+      const partnerAFee = Number(sr.escalation?.partnerAFee || 0);
+      const partnerBFee = Number(sr.escalation?.partnerBFee || 0);
+      const partsCost = Number(sr.repairExpense || 0);
+      const laborCost = Math.max(0, totalCost - partsCost);
+
+      if (totalCost > 0 || adminFee > 0) {
+        mappedRepairs.push({
+          id: sr._id.toString(),
+          customerName: sr.customerInfo?.fullName || "Customer",
+          customerPhone: sr.customerInfo?.phoneNumber || "",
+          deviceModel: `${sr.deviceInfo?.brandName || sr.deviceInfo?.make || ""} ${sr.deviceInfo?.model || ""}`.trim() || "Unknown Device",
+          repairType: sr.deviceInfo?.problemDescription || (sr.escalation?.isEscalated ? "Escalated Network Job" : "Repair Service"),
+          source: sr.escalation?.isEscalated ? "Escalated Job" : "Service Request",
+          laborCost: laborCost,
+          partsCost: partsCost,
+          adminFee: adminFee,
+          partnerAFee: partnerAFee,
+          partnerBFee: partnerBFee,
+          paymentStatus: sr.paymentStatus === "paid" ? "Paid" : "Unpaid",
+          date: srDate,
+          notes: sr.escalation?.isEscalated
+            ? `Escalated Job — Total: TZS ${totalCost.toLocaleString()} (Partner A: ${partnerAFee.toLocaleString()}, Admin Fee: ${adminFee.toLocaleString()}, Partner B: ${partnerBFee.toLocaleString()})`
+            : `Service Request ${sr.trackingId}`,
+          linkedRequestInfo: sr.trackingId || "Service Request",
         });
       }
     });
