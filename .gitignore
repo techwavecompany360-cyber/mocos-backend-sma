@@ -137,3 +137,19 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Credentials & Secrets — NEVER commit these
+gcs-service-account.json
+*-service-account.json
+*-service-account-*.json
+service-account*.json
+serviceaccount*.json
+firebase-adminsdk*.json
+*credentials*.json
+*secret*.json
+*.pem
+*.key
+*.p12
+*.pfx
+google-cloud-key*.json
+keyfile.json
