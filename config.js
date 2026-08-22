@@ -7,7 +7,7 @@ module.exports = {
   JWT_SECRET: process.env.JWT_SECRET || 'b6e2c7e7-8f2a-4c1e-9d2e-7a3f4b8c2d1f',
   ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS 
     ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()) 
-    : ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175', 'http://localhost:5176', 'https://dashboard.mocos.co.tz', 'https://management.mocos.co.tz', 'https://deposit.mocos.co.tz', 'https://mocos.co.tz', 'https://www.mocos.co.tz'],
+    : ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175', 'http://localhost:5176', 'https://admin.mocos.co.tz', 'https://dashboard.mocos.co.tz', 'https://management.mocos.co.tz', 'https://deposit.mocos.co.tz', 'https://mocos.co.tz', 'https://www.mocos.co.tz'],
   VAPID_PUBLIC_KEY: process.env.VAPID_PUBLIC_KEY || '',
   VAPID_PRIVATE_KEY: process.env.VAPID_PRIVATE_KEY || '',
   VAPID_SUBJECT: process.env.VAPID_SUBJECT || 'mailto:admin@mocos.co.tz',
