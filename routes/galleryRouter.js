@@ -29,29 +29,49 @@ function authenticateToken(req, res, next) {
 const storage = multer.memoryStorage();
 const upload = multer({ storage, limits: { fileSize: 30 * 1024 * 1024 } });
 
-// POST /api/gallery - upload image
+// POST /api/gallery - upload image (Max 12 images)
 router.post('/', authenticateToken, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Image file is required' });
     const db = await connectDB();
-    const alt = req.body.alt || '';
+
+    const count = await db.collection('gallery').countDocuments();
+    if (count >= 12) {
+      return res.status(400).json({ error: 'Gallery is full (maximum 12 pictures allowed). Please delete an existing picture before uploading a new one.' });
+    }
+
+    const alt = (req.body.alt || req.body.caption || '').trim();
+    const title = (req.body.title || alt || '').trim();
     const filename = gcsStorage.generateFilename('gallery', req.file.originalname);
     const destPath = `gallery/${filename}`;
     const url = await gcsStorage.uploadFile(req.file.buffer, destPath, req.file.mimetype);
-    const doc = { url, alt, gcsPath: destPath };
+    const doc = {
+      url,
+      alt: alt || 'Workshop Gallery',
+      title: title || 'Our Workshop & Repairs',
+      gcsPath: destPath,
+      createdAt: new Date(),
+      order: count + 1
+    };
     const result = await db.collection('gallery').insertOne(doc);
-    res.status(201).json({ id: result.insertedId.toString(), url, alt });
+    res.status(201).json({ id: result.insertedId.toString(), url, alt: doc.alt, title: doc.title, createdAt: doc.createdAt });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET /api/gallery - list images
-router.get('/', authenticateToken, async (req, res) => {
+// GET /api/gallery - list images (public for website & dashboard)
+router.get('/', async (req, res) => {
   try {
     const db = await connectDB();
-    const images = await db.collection('gallery').find().toArray();
-    res.json(images.map(img => ({ id: img._id.toString(), url: img.url, alt: img.alt })));
+    const images = await db.collection('gallery').find().sort({ createdAt: 1 }).toArray();
+    res.json(images.map(img => ({
+      id: img._id.toString(),
+      url: img.url,
+      alt: img.alt || img.title || 'Our Work & Workshop',
+      title: img.title || img.alt || 'Our Work & Workshop',
+      createdAt: img.createdAt || null
+    })));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

@@ -564,7 +564,7 @@ router.get('/download/:token', async (req, res) => {
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(purchase.fileName)}"`);
     res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('X-Download-Warning', DOWNLOAD_WARNING_MESSAGE);
+    res.setHeader('X-Download-Warning', encodeURIComponent(DOWNLOAD_WARNING_MESSAGE));
 
     // Stream file contents from GCS
     const gcsStream = gcsStorage.createReadStream(destPath, streamOptions);

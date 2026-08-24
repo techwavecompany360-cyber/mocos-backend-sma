@@ -865,7 +865,7 @@ router.get("/blogpost", async (req, res) => {
 });
 
 // GET all blog posts metadata (lightweight, zero GCS overhead, pagination support)
-router.get("/blogposts", async (req, res) => {
+router.get(["/blogposts", "/blog/posts"], async (req, res) => {
   try {
     const db = await connectDB();
     const limit = parseInt(req.query.limit) || 0;
