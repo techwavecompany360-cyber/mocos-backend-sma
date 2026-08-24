@@ -154,11 +154,29 @@ function generateFilename(prefix, originalName) {
   return `${prefix}-${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}`;
 }
 
+/**
+ * Create a writable stream to GCS for large file streaming (e.g., firmware files up to 100GB).
+ * The file is streamed directly to GCS without buffering the entire content in memory.
+ * Uses GCS resumable upload internally for reliability on large files.
+ * @param {string} destPath - Destination path in the bucket (e.g., 'firmware/file.bin')
+ * @param {string} contentType - MIME type of the file
+ * @returns {WritableStream} A writable stream — pipe your file stream into this
+ */
+function createWriteStream(destPath, contentType) {
+  const file = bucket.file(destPath);
+  return file.createWriteStream({
+    metadata: { contentType },
+    resumable: true,   // Required for files > 5MB; handles network interruptions
+    validation: false, // Skip MD5 validation for speed on very large files
+  });
+}
+
 module.exports = {
   uploadFile,
   uploadBuffer,
   downloadFile,
   createReadStream,
+  createWriteStream,
   getFileMetadata,
   deleteFile,
   getSignedUrl,

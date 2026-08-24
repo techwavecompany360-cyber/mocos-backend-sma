@@ -21,9 +21,13 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.use(bodyParser.json({ limit: '500mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '500mb' }));
+// Note: firmware file uploads bypass body-parser via busboy streaming.
+// body-parser handles JSON/form API payloads only.
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+// No body size limit for raw binary streams (handled per-route by busboy)
 app.use('/public', express.static(path.join(__dirname, 'public')));
+
 
 // Import and use the routers
 const dataRouter = require('./routes/dataRouter');

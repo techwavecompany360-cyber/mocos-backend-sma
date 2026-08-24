@@ -1,5 +1,6 @@
 const express = require('express');
 const multer = require('multer');
+const busboy = require('busboy');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -14,23 +15,104 @@ const router = express.Router();
 
 const DOWNLOAD_WARNING_MESSAGE = "⚠️ WARNING: Do NOT share this download link with anyone. Once the download completes on any device, this single-use link will permanently expire and cannot be used again.";
 
-// Multer memory storage
-const storage = multer.memoryStorage();
-
-const imageFilter = (req, file, cb) => {
-  if (file.fieldname === 'image') {
+// Multer for image-only uploads (small files, buffered in memory — max 50MB)
+const imageOnlyStorage = multer.memoryStorage();
+const imageUpload = multer({
+  storage: imageOnlyStorage,
+  fileFilter: (req, file, cb) => {
     if (!file.mimetype.startsWith('image/')) {
       return cb(new Error('Only image files are allowed for the cover photo.'));
     }
-  }
-  cb(null, true);
-};
+    cb(null, true);
+  },
+  limits: { fileSize: 50 * 1024 * 1024 } // 50 MB for images
+});
 
+// Legacy multer instance (kept for backward-compat routes that need both file+image buffered)
+const storage = multer.memoryStorage();
 const upload = multer({
   storage,
-  fileFilter: imageFilter,
-  limits: { fileSize: 500 * 1024 * 1024 } // 500 MB limit
+  limits: { fileSize: 100 * 1024 * 1024 * 1024 } // 100 GB max
 });
+
+/**
+ * Stream a multipart request's main firmware file directly to GCS (no memory buffering).
+ * Returns a Promise that resolves to { storedFileName, fileSize, originalName, mimetype }
+ * The image file (if present) is buffered into imageBuffer.
+ */
+function streamFirmwareUpload(req) {
+  return new Promise((resolve, reject) => {
+    const bb = busboy({
+      headers: req.headers,
+      limits: { fileSize: 100 * 1024 * 1024 * 1024 } // 100 GB
+    });
+
+    const fields = {};
+    let imageBuf = null;
+    let imageOriginalName = null;
+    let imageMimetype = null;
+
+    let filePromise = null; // Promise for the firmware file streaming
+
+    bb.on('field', (name, val) => {
+      fields[name] = val;
+    });
+
+    bb.on('file', (fieldname, fileStream, info) => {
+      const { filename, mimeType } = info;
+
+      if (fieldname === 'image') {
+        // Buffer the cover image (small, typically < 5MB)
+        const chunks = [];
+        fileStream.on('data', chunk => chunks.push(chunk));
+        fileStream.on('end', () => {
+          imageBuf = Buffer.concat(chunks);
+          imageOriginalName = filename;
+          imageMimetype = mimeType;
+        });
+        fileStream.on('error', reject);
+        return;
+      }
+
+      if (fieldname === 'file') {
+        // Stream the firmware file directly to GCS — no memory buffering!
+        const storedFileName = gcsStorage.generateFilename('fw', filename);
+        const destPath = `firmware/${storedFileName}`;
+        let byteCount = 0;
+
+        filePromise = new Promise((res2, rej2) => {
+          const gcsWriteStream = gcsStorage.createWriteStream(destPath, mimeType || 'application/octet-stream');
+
+          fileStream.on('data', chunk => { byteCount += chunk.length; });
+          fileStream.on('error', rej2);
+
+          gcsWriteStream.on('error', rej2);
+          gcsWriteStream.on('finish', () => {
+            res2({ storedFileName, fileSize: byteCount, originalName: filename, mimetype: mimeType });
+          });
+
+          fileStream.pipe(gcsWriteStream);
+        });
+        return;
+      }
+
+      // Discard any other field-files
+      fileStream.resume();
+    });
+
+    bb.on('finish', async () => {
+      try {
+        const fileResult = filePromise ? await filePromise : null;
+        resolve({ fields, fileResult, imageBuf, imageOriginalName, imageMimetype });
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    bb.on('error', reject);
+    req.pipe(bb);
+  });
+}
 
 // Helper: build public image URL from stored filename
 function buildImageUrl(req, storedImageName) {
@@ -133,12 +215,19 @@ router.delete('/categories/:id', async (req, res) => {
 });
 
 /**
+/**
  * POST /api/firmware
- * Admin: Upload a new firmware or software item (with optional cover image)
+ * Admin: Upload a new firmware or software item (with optional cover image).
+ * Uses streaming upload for the main firmware/software file so it is piped
+ * DIRECTLY to Google Cloud Storage without loading into memory — supports 100GB+.
  */
-router.post('/', upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', maxCount: 1 }]), async (req, res) => {
+router.post('/', async (req, res) => {
   try {
-    const { title, type, category, price, description } = req.body;
+    // Parse multipart form via busboy streaming
+    const { fields, fileResult, imageBuf, imageOriginalName, imageMimetype } =
+      await streamFirmwareUpload(req);
+
+    const { title, type, category, price, description } = fields;
 
     if (!title || !title.trim()) {
       return res.status(400).json({ error: 'Title is required.' });
@@ -149,8 +238,7 @@ router.post('/', upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', 
     if (!category || !category.trim()) {
       return res.status(400).json({ error: 'Category is required.' });
     }
-    const mainFile = req.files?.file?.[0];
-    if (!mainFile) {
+    if (!fileResult) {
       return res.status(400).json({ error: 'A firmware/software file is required.' });
     }
     const priceNum = parseFloat(price);
@@ -158,20 +246,12 @@ router.post('/', upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', 
       return res.status(400).json({ error: 'Price must be a non-negative number.' });
     }
 
-    const imageFile = req.files?.image?.[0];
-
-    let storedFileName = null;
-    if (mainFile) {
-      storedFileName = gcsStorage.generateFilename('fw', mainFile.originalname);
-      const destPath = `firmware/${storedFileName}`;
-      await gcsStorage.uploadFile(mainFile.buffer, destPath, mainFile.mimetype || 'application/octet-stream', false);
-    }
-
+    // Upload cover image to GCS if provided (small file — buffered OK)
     let storedImageName = null;
-    if (imageFile) {
-      storedImageName = gcsStorage.generateFilename('fw-img', imageFile.originalname);
-      const destPath = `firmware-images/${storedImageName}`;
-      await gcsStorage.uploadFile(imageFile.buffer, destPath, imageFile.mimetype);
+    if (imageBuf && imageBuf.length > 0) {
+      storedImageName = gcsStorage.generateFilename('fw-img', imageOriginalName || 'cover.jpg');
+      const imgDestPath = `firmware-images/${storedImageName}`;
+      await gcsStorage.uploadFile(imageBuf, imgDestPath, imageMimetype || 'image/jpeg');
     }
 
     const db = await connectDB();
@@ -182,12 +262,13 @@ router.post('/', upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', 
       category: category.trim(),
       price: priceNum,
       description: description || '',
-      fileName: mainFile.originalname,
-      storedFileName,
-      fileSize: mainFile.size,
-      fileMimeType: mainFile.mimetype,
+      fileName: fileResult.originalName,
+      storedFileName: fileResult.storedFileName,
+      fileSize: fileResult.fileSize,
+      fileMimeType: fileResult.mimetype,
       storedImageName,
       downloads: 0,
+      hidden: false,
       createdAt: new Date()
     };
 
@@ -195,7 +276,7 @@ router.post('/', upload.fields([{ name: 'file', maxCount: 1 }, { name: 'image', 
 
     res.status(201).json({
       success: true,
-      message: `${type} "${title}" uploaded successfully!`,
+      message: `${type} "${title.trim()}" uploaded successfully!`,
       item: {
         id: result.insertedId.toString(),
         ...doc,
