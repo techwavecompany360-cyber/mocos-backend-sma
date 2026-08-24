@@ -306,9 +306,39 @@ router.get('/:id', async (req, res) => {
 });
 
 /**
+ * GET /api/firmware/:id/active-purchase
+ * Customer: Check if customer has an active uncompleted purchase for this firmware item
+ */
+router.get('/:id/active-purchase', authenticateCustomer, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const purchase = await db.collection('firmware_purchases').findOne({
+      customerId: req.customer.id,
+      firmwareId: req.params.id,
+      status: { $ne: 'Completed' }
+    });
+    if (!purchase) {
+      return res.json({ hasActivePurchase: false });
+    }
+    res.json({
+      hasActivePurchase: true,
+      downloadToken: purchase.downloadToken,
+      downloadUrl: buildDownloadUrl(req, purchase.downloadToken),
+      status: purchase.status,
+      fileName: purchase.fileName,
+      fileSize: purchase.fileSize,
+      title: purchase.firmwareTitle
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * POST /api/firmware/:id/purchase
  * Customer: Purchase access to a firmware/software item.
- * Deducts wallet balance and returns a one-time download token (15min expiry).
+ * Deducts wallet balance and returns a download link.
+ * If user already purchased and download is not completed, re-uses the active link with 0 deduction!
  */
 router.post('/:id/purchase', authenticateCustomer, async (req, res) => {
   try {
@@ -322,7 +352,36 @@ router.post('/:id/purchase', authenticateCustomer, async (req, res) => {
 
     const currentBalance = Number(customer.wallet?.balance || 0);
 
-    if (currentBalance < item.price) {
+    // 1. Check if customer already has an active (uncompleted) purchase for this firmware item
+    const existingPurchase = await db.collection('firmware_purchases').findOne({
+      customerId: customer._id.toString(),
+      firmwareId: item._id.toString(),
+      status: { $ne: 'Completed' }
+    });
+
+    if (existingPurchase) {
+      // Re-use active uncompleted download without charging wallet!
+      return res.json({
+        success: true,
+        isExisting: true,
+        message: 'Active download link restored. You can download and resume this file anytime until 100% completed.',
+        downloadToken: existingPurchase.downloadToken,
+        downloadUrl: buildDownloadUrl(req, existingPurchase.downloadToken),
+        status: existingPurchase.status,
+        newBalance: currentBalance,
+        warningMessage: DOWNLOAD_WARNING_MESSAGE,
+        item: {
+          id: item._id.toString(),
+          title: item.title,
+          type: item.type,
+          fileName: item.fileName,
+          fileSize: item.fileSize
+        }
+      });
+    }
+
+    // 2. If new purchase and item has price > 0, check balance
+    if (item.price > 0 && currentBalance < item.price) {
       return res.status(402).json({
         error: 'insufficient_balance',
         message: `Your wallet balance is ${currentBalance.toLocaleString()} TZS. You need ${item.price.toLocaleString()} TZS to purchase "${item.title}". You need ${(item.price - currentBalance).toLocaleString()} TZS more. Please visit any Mocos branch to top up your wallet.`,
@@ -332,74 +391,67 @@ router.post('/:id/purchase', authenticateCustomer, async (req, res) => {
       });
     }
 
-    // Deduct balance
-    const newBalance = currentBalance - item.price;
-    await db.collection('customers').updateOne(
-      { _id: customer._id },
-      { $set: { 'wallet.balance': newBalance } }
-    );
-
-    // Log transaction
-    await db.collection('wallet_transactions').insertOne({
-      customerId: customer._id.toString(),
-      customerName: customer.fullName,
-      walletNumber: customer.wallet?.accountNumber,
-      type: 'purchase',
-      itemId: item._id.toString(),
-      itemTitle: item.title,
-      itemType: item.type,
-      amount: item.price,
-      oldBalance: currentBalance,
-      newBalance,
-      description: `Purchase: ${item.type} - ${item.title}`,
-      createdAt: new Date()
-    });
-
-    // Check if customer already has an active (uncompleted) purchase for this firmware item
-    const existingPurchase = await db.collection('firmware_purchases').findOne({
-      customerId: customer._id.toString(),
-      firmwareId: item._id.toString(),
-      status: { $ne: 'Completed' }
-    });
-
-    let token;
-    if (existingPurchase) {
-      token = existingPurchase.downloadToken;
-    } else {
-      token = `dl-${crypto.randomBytes(16).toString('hex')}`;
-      const purchaseDoc = {
-        customerId: customer._id.toString(),
-        customerName: customer.fullName || customer.phone || 'Customer',
-        customerPhone: customer.phone,
-        firmwareId: item._id.toString(),
-        firmwareTitle: item.title,
-        firmwareType: item.type,
-        storedFileName: item.storedFileName,
-        fileName: item.fileName,
-        fileSize: item.fileSize || 0,
-        price: item.price,
-        downloadToken: token,
-        status: 'Pending', // 'Pending' | 'Downloading' | 'Completed'
-        downloadCount: 0,
-        completedAt: null,
-        createdAt: new Date(),
-        warningMessage: DOWNLOAD_WARNING_MESSAGE
-      };
-      await db.collection('firmware_purchases').insertOne(purchaseDoc);
-
-      // Increment download/purchase counter on firmware item
-      await db.collection('firmware').updateOne(
-        { _id: item._id },
-        { $inc: { downloads: 1 } }
+    // 3. Deduct balance (if price > 0)
+    let newBalance = currentBalance;
+    if (item.price > 0) {
+      newBalance = currentBalance - item.price;
+      await db.collection('customers').updateOne(
+        { _id: customer._id },
+        { $set: { 'wallet.balance': newBalance } }
       );
+
+      // Log transaction
+      await db.collection('wallet_transactions').insertOne({
+        customerId: customer._id.toString(),
+        customerName: customer.fullName,
+        walletNumber: customer.wallet?.accountNumber,
+        type: 'purchase',
+        itemId: item._id.toString(),
+        itemTitle: item.title,
+        itemType: item.type,
+        amount: item.price,
+        oldBalance: currentBalance,
+        newBalance,
+        description: `Purchase: ${item.type} - ${item.title}`,
+        createdAt: new Date()
+      });
     }
+
+    // 4. Create new purchase document with fresh token
+    const token = `dl-${crypto.randomBytes(16).toString('hex')}`;
+    const purchaseDoc = {
+      customerId: customer._id.toString(),
+      customerName: customer.fullName || customer.phone || 'Customer',
+      customerPhone: customer.phone,
+      firmwareId: item._id.toString(),
+      firmwareTitle: item.title,
+      firmwareType: item.type,
+      storedFileName: item.storedFileName,
+      fileName: item.fileName,
+      fileSize: item.fileSize || 0,
+      price: item.price,
+      downloadToken: token,
+      status: 'Pending', // 'Pending' | 'Downloading' | 'Completed'
+      downloadCount: 0,
+      completedAt: null,
+      createdAt: new Date(),
+      warningMessage: DOWNLOAD_WARNING_MESSAGE
+    };
+    await db.collection('firmware_purchases').insertOne(purchaseDoc);
+
+    // Increment download counter on firmware item
+    await db.collection('firmware').updateOne(
+      { _id: item._id },
+      { $inc: { downloads: 1 } }
+    );
 
     res.json({
       success: true,
-      message: 'Purchase successful! Your download link is ready and can be resumed anytime until full completion.',
+      isExisting: false,
+      message: 'Purchase successful! Your download link is ready and stored in your account until fully completed.',
       downloadToken: token,
       downloadUrl: buildDownloadUrl(req, token),
-      status: existingPurchase ? existingPurchase.status : 'Pending',
+      status: 'Pending',
       newBalance,
       warningMessage: DOWNLOAD_WARNING_MESSAGE,
       item: {
@@ -439,7 +491,10 @@ router.get('/purchases/my', authenticateCustomer, async (req, res) => {
         fileSize: p.fileSize,
         price: p.price,
         status: p.status, // 'Pending' | 'Downloading' | 'Completed'
+        isCompleted: p.status === 'Completed',
+        downloadToken: p.status === 'Completed' ? null : p.downloadToken,
         downloadUrl: p.status === 'Completed' ? null : buildDownloadUrl(req, p.downloadToken),
+        downloadCount: p.downloadCount || 0,
         completedAt: p.completedAt,
         createdAt: p.createdAt,
         warningMessage: p.status === 'Completed'
