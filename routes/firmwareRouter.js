@@ -750,20 +750,29 @@ router.put('/:id', upload.fields([{ name: 'image', maxCount: 1 }]), async (req, 
 
 /**
  * DELETE /api/firmware/:id
- * Admin: Delete a firmware/software item and its file
+ * Admin: Delete a firmware/software item, its binary file, cover image, and associated purchase records
  */
 router.delete('/:id', async (req, res) => {
   try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid firmware item ID.' });
+    }
+
     const db = await connectDB();
-    const item = await db.collection('firmware').findOne({ _id: new ObjectId(req.params.id) });
-    if (!item) return res.status(404).json({ error: 'Item not found.' });
+    const item = await db.collection('firmware').findOne({ _id: new ObjectId(id) });
+    if (!item) return res.status(404).json({ error: 'Firmware/software item not found.' });
 
     // Delete firmware binary file from GCS
     if (item.storedFileName) {
       const fwGcsPath = item.storedFileName.startsWith('http')
         ? gcsStorage.extractGcsPath(item.storedFileName)
         : `firmware/${item.storedFileName}`;
-      if (fwGcsPath) await gcsStorage.deleteFile(fwGcsPath);
+      if (fwGcsPath) {
+        await gcsStorage.deleteFile(fwGcsPath).catch(err => {
+          console.warn(`[GCS Firmware Delete Warning]:`, err.message);
+        });
+      }
     }
 
     // Delete cover image from GCS if exists
@@ -771,13 +780,22 @@ router.delete('/:id', async (req, res) => {
       const imgGcsPath = item.storedImageName.startsWith('http')
         ? gcsStorage.extractGcsPath(item.storedImageName)
         : `firmware-images/${item.storedImageName}`;
-      if (imgGcsPath) await gcsStorage.deleteFile(imgGcsPath);
+      if (imgGcsPath) {
+        await gcsStorage.deleteFile(imgGcsPath).catch(err => {
+          console.warn(`[GCS Firmware Image Delete Warning]:`, err.message);
+        });
+      }
     }
 
+    // Clean up associated purchases
+    await db.collection('firmware_purchases').deleteMany({ firmwareId: item._id.toString() }).catch(() => {});
+
+    // Delete item record
     await db.collection('firmware').deleteOne({ _id: item._id });
 
     res.json({ success: true, message: `"${item.title}" deleted successfully.` });
   } catch (error) {
+    console.error('[Firmware Delete Error]:', error);
     res.status(500).json({ error: error.message });
   }
 });
