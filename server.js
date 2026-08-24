@@ -8,6 +8,9 @@ const { initSocket } = require('./utils/socketManager');
 
 const app = express();
 
+// Trust the first proxy (nginx) so req.protocol correctly returns 'https' behind SSL termination
+app.set('trust proxy', 1);
+
 // Configure CORS for allowed origins
 const corsOptions = {
   origin: function (origin, callback) {

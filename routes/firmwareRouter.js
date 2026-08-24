@@ -124,8 +124,10 @@ function buildImageUrl(req, storedImageName) {
 }
 
 // Helper: build purchase download URL
+// Trusts X-Forwarded-Proto header set by nginx for HTTPS detection behind reverse proxy
 function buildDownloadUrl(req, token) {
-  const protocol = req.protocol;
+  const forwardedProto = req.headers['x-forwarded-proto'];
+  const protocol = forwardedProto ? forwardedProto.split(',')[0].trim() : req.protocol;
   const host = req.get('host');
   return `${protocol}://${host}/api/firmware/download/${token}`;
 }
@@ -705,6 +707,12 @@ router.get('/download/:token', async (req, res) => {
     // Stream file contents from GCS
     const gcsStream = gcsStorage.createReadStream(destPath, streamOptions);
     let bytesTransferred = 0;
+    let clientDisconnected = false;
+
+    // Detect if the client disconnects / cancels before the stream finishes
+    req.on('close', () => {
+      clientDisconnected = true;
+    });
 
     gcsStream.on('data', (chunk) => {
       bytesTransferred += chunk.length;
@@ -712,10 +720,16 @@ router.get('/download/:token', async (req, res) => {
 
     gcsStream.pipe(res);
 
-    // Listen for response completion
+    // Listen for response completion — only mark Completed if client did NOT disconnect
     res.on('finish', async () => {
-      const isFullDownload = !rangeHeader && fileSize > 0 && bytesTransferred >= Math.floor(fileSize * 0.95);
-      const isRangeEndReached = rangeHeader && fileSize > 0 && end === fileSize - 1 && bytesTransferred >= Math.floor((end - start + 1) * 0.95);
+      // If the client cancelled / disconnected, do NOT mark as Completed
+      if (clientDisconnected) {
+        console.log(`[Firmware Download Cancelled]: Purchase ${purchase._id} ("${purchase.fileName}") — client disconnected, keeping status as Downloading.`);
+        return;
+      }
+
+      const isFullDownload = !rangeHeader && fileSize > 0 && bytesTransferred >= Math.floor(fileSize * 0.99);
+      const isRangeEndReached = rangeHeader && fileSize > 0 && end === fileSize - 1 && bytesTransferred >= Math.floor((end - start + 1) * 0.99);
 
       if (isFullDownload || isRangeEndReached) {
         console.log(`[Firmware Download Completed]: Purchase ${purchase._id} ("${purchase.fileName}") marked as Completed.`);
@@ -728,6 +742,8 @@ router.get('/download/:token', async (req, res) => {
             }
           }
         );
+      } else {
+        console.log(`[Firmware Download Partial]: Purchase ${purchase._id} — ${bytesTransferred}/${fileSize} bytes transferred. Status stays active.`);
       }
     });
 
