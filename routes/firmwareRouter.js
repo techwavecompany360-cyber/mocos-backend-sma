@@ -708,10 +708,23 @@ router.get('/download/:token', async (req, res) => {
     const gcsStream = gcsStorage.createReadStream(destPath, streamOptions);
     let bytesTransferred = 0;
     let clientDisconnected = false;
+    let responseFinished = false;
 
-    // Detect if the client disconnects / cancels before the stream finishes
+    // req 'close' fires when the TCP connection closes (client cancel/disconnect)
+    // We also destroy the GCS stream to stop reading from cloud storage
     req.on('close', () => {
-      clientDisconnected = true;
+      if (!responseFinished) {
+        clientDisconnected = true;
+        if (!gcsStream.destroyed) gcsStream.destroy();
+        console.log(`[Firmware Download Cancelled]: Purchase ${purchase._id} ("${purchase.fileName}") — connection closed before completion. Status stays active.`);
+      }
+    });
+
+    // res 'close' fires when the connection is terminated before the response finishes
+    res.on('close', () => {
+      if (!responseFinished) {
+        clientDisconnected = true;
+      }
     });
 
     gcsStream.on('data', (chunk) => {
@@ -720,11 +733,18 @@ router.get('/download/:token', async (req, res) => {
 
     gcsStream.pipe(res);
 
-    // Listen for response completion — only mark Completed if client did NOT disconnect
+    // 'finish' fires when all data has been flushed to the OS socket buffer.
+    // We wait one event-loop tick to allow any pending 'close' events to fire first
+    // (close can arrive slightly after finish for small files on fast connections).
     res.on('finish', async () => {
-      // If the client cancelled / disconnected, do NOT mark as Completed
-      if (clientDisconnected) {
-        console.log(`[Firmware Download Cancelled]: Purchase ${purchase._id} ("${purchase.fileName}") — client disconnected, keeping status as Downloading.`);
+      // Yield to the event loop so req/res 'close' events can fire if they are pending
+      await new Promise(resolve => setImmediate(resolve));
+
+      responseFinished = true;
+
+      // If client disconnected/cancelled, do NOT mark as Completed
+      if (clientDisconnected || req.socket?.destroyed) {
+        console.log(`[Firmware Download Cancelled]: Purchase ${purchase._id} ("${purchase.fileName}") — socket destroyed. Status stays active.`);
         return;
       }
 
@@ -732,7 +752,7 @@ router.get('/download/:token', async (req, res) => {
       const isRangeEndReached = rangeHeader && fileSize > 0 && end === fileSize - 1 && bytesTransferred >= Math.floor((end - start + 1) * 0.99);
 
       if (isFullDownload || isRangeEndReached) {
-        console.log(`[Firmware Download Completed]: Purchase ${purchase._id} ("${purchase.fileName}") marked as Completed.`);
+        console.log(`[Firmware Download Completed]: Purchase ${purchase._id} ("${purchase.fileName}") marked as Completed. (${bytesTransferred}/${fileSize} bytes)`);
         await db.collection('firmware_purchases').updateOne(
           { _id: purchase._id },
           {
@@ -743,11 +763,12 @@ router.get('/download/:token', async (req, res) => {
           }
         );
       } else {
-        console.log(`[Firmware Download Partial]: Purchase ${purchase._id} — ${bytesTransferred}/${fileSize} bytes transferred. Status stays active.`);
+        console.log(`[Firmware Download Partial]: Purchase ${purchase._id} — ${bytesTransferred}/${fileSize} bytes. Status stays active for re-download.`);
       }
     });
 
     gcsStream.on('error', (err) => {
+      if (err.message?.includes('destroyed')) return; // Expected when client cancels
       console.error('[GCS Download Stream Error]:', err.message);
       if (!res.headersSent) {
         res.status(500).json({ error: 'Download stream failed. Please retry from your account.' });
