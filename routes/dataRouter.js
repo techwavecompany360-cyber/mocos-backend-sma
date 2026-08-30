@@ -735,8 +735,19 @@ router.get("/dashboard-stats", async (req, res) => {
 router.get("/sellData", async (req, res) => {
   try {
     const db = await connectDB();
-    const allData = await db.collection("sellData").find().toArray();
-    res.status(200).json(allData);
+    const allData = await db.collection("sellData").find().sort({ submittedAt: -1 }).toArray();
+    res.status(200).json(allData.map(item => ({
+      ...item,
+      id: item._id.toString(),
+      name: item.name || item.sellName || item.fullName || "—",
+      phone: item.phone || item.sellPhone || item.phoneNumber || "—",
+      region: item.region || item.sellRegion || "—",
+      district: item.district || item.sellDistrict || "—",
+      condition: item.condition || item.deviceCondition || "—",
+      deviceName: item.deviceName || item.item || item.deviceBrand || "—",
+      new: item.new || item.status || "new",
+      submittedAt: item.submittedAt || item.date || new Date()
+    })));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -745,18 +756,46 @@ router.get("/sellData", async (req, res) => {
 router.get("/repairData", async (req, res) => {
   try {
     const db = await connectDB();
-    const allData = await db.collection("repairData").find().toArray();
-    res.status(200).json(allData);
+    const allData = await db.collection("repairData").find().sort({ submittedAt: -1 }).toArray();
+    res.status(200).json(allData.map(item => ({
+      ...item,
+      id: item._id.toString(),
+      remoteName: item.remoteName || item.name || item.fullName || "—",
+      remotePhone: item.remotePhone || item.phone || item.phoneNumber || "—",
+      remoteDevice: item.remoteDevice || item.device || item.deviceName || "—",
+      remoteProblem: item.remoteProblem || item.problem || item.issue || "—",
+      remoteRegion: item.remoteRegion || item.region || "—",
+      remoteDistrict: item.remoteDistrict || item.district || "—",
+      remoteShippingPref: item.remoteShippingPref || item.shippingPref || item.shipping || "—",
+      new: item.new || item.status || "new",
+      submittedAt: item.submittedAt || item.date || new Date()
+    })));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
-// Unauthenticated GET endpoint to fetch all data from MongoDB
+
+// GET endpoint to fetch all booking requests from MongoDB
 router.get("/bookData", async (req, res) => {
   try {
     const db = await connectDB();
-    const allData = await db.collection("bookData").find().toArray();
-    res.status(200).json(allData);
+    const allData = await db.collection("bookData").find().sort({ submittedAt: -1 }).toArray();
+    res.status(200).json(allData.map(item => ({
+      ...item,
+      id: item._id.toString(),
+      name: item.name || item.bookName || item.fullName || "—",
+      phone: item.phone || item.bookPhone || item.phoneNumber || "—",
+      device: item.device || item.bookDevice || item.deviceModel || "—",
+      service: item.service || item.bookService || item.serviceNeeded || "—",
+      problem: item.problem || item.bookProblem || item.issue || "—",
+      bookName: item.bookName || item.name || item.fullName || "—",
+      bookPhone: item.bookPhone || item.phone || item.phoneNumber || "—",
+      bookDevice: item.bookDevice || item.device || item.deviceModel || "—",
+      bookService: item.bookService || item.service || item.serviceNeeded || "—",
+      bookProblem: item.bookProblem || item.problem || item.issue || "—",
+      new: item.new || item.status || "new",
+      submittedAt: item.submittedAt || item.date || new Date()
+    })));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

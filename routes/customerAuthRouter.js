@@ -344,6 +344,380 @@ router.delete('/delete-account', authenticateCustomer, async (req, res) => {
   }
 });
 
+// ─── ADMIN ENDPOINTS ─────────────────────────────────────────────────────────
+// These require the standard admin JWT token (same as dataRouter's authenticateToken).
+
+function authenticateAdmin(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Access denied. Admin token missing.' });
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) return res.status(403).json({ error: 'Invalid or expired admin token.' });
+    req.adminUser = decoded;
+    next();
+  });
+}
+
+/**
+ * GET /api/customer/admin/users
+ * List all registered website customers with wallet summary.
+ * Query params: search (name/phone/email/wallet#), page, limit
+ */
+router.get('/admin/users', authenticateAdmin, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const { search = '', page = 1, limit = 50 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    let query = {};
+    if (search && search.trim()) {
+      const s = search.trim();
+      query = {
+        $or: [
+          { fullName: { $regex: s, $options: 'i' } },
+          { phone: { $regex: s, $options: 'i' } },
+          { email: { $regex: s, $options: 'i' } },
+          { 'wallet.accountNumber': { $regex: s, $options: 'i' } },
+          { 'wallet.phoneNumbers': { $regex: s, $options: 'i' } }
+        ]
+      };
+    }
+
+    const [customers, total] = await Promise.all([
+      db.collection('customers')
+        .find(query, { projection: { password: 0 } })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .toArray(),
+      db.collection('customers').countDocuments(query)
+    ]);
+
+    // Aggregate wallet stats
+    const statsAgg = await db.collection('customers').aggregate([
+      {
+        $group: {
+          _id: null,
+          totalUsers: { $sum: 1 },
+          totalWalletBalance: { $sum: '$wallet.balance' },
+          newThisMonth: {
+            $sum: {
+              $cond: [
+                { $gte: ['$createdAt', new Date(new Date().getFullYear(), new Date().getMonth(), 1)] },
+                1, 0
+              ]
+            }
+          }
+        }
+      }
+    ]).toArray();
+
+    const stats = statsAgg[0] || { totalUsers: 0, totalWalletBalance: 0, newThisMonth: 0 };
+
+    res.json({
+      customers: customers.map(c => ({
+        id: c._id.toString(),
+        fullName: c.fullName,
+        phone: c.phone,
+        email: c.email || null,
+        wallet: {
+          accountNumber: c.wallet?.accountNumber || null,
+          balance: c.wallet?.balance || 0,
+          phoneNumbers: c.wallet?.phoneNumbers || [],
+          addedPhoneCount: c.wallet?.addedPhoneCount || 0,
+          createdAt: c.wallet?.createdAt || null
+        },
+        createdAt: c.createdAt
+      })),
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(total / parseInt(limit))
+      },
+      stats: {
+        totalUsers: stats.totalUsers,
+        totalWalletBalance: stats.totalWalletBalance,
+        newThisMonth: stats.newThisMonth
+      }
+    });
+  } catch (error) {
+    console.error('[Admin Users List Error]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/customer/admin/users/:id
+ * Get a single customer's full profile + wallet + paginated transaction history.
+ */
+router.get('/admin/users/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const { id } = req.params;
+    const txPage = parseInt(req.query.txPage) || 1;
+    const txLimit = parseInt(req.query.txLimit) || 10;
+    const txType = req.query.txType || '';
+    const txSort = req.query.txSort === 'asc' ? 1 : -1;
+    const txSearch = req.query.txSearch || '';
+    const txSkip = (txPage - 1) * txLimit;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid customer ID.' });
+    }
+
+    const customer = await db.collection('customers').findOne(
+      { _id: new ObjectId(id) },
+      { projection: { password: 0 } }
+    );
+
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found.' });
+    }
+
+    // Build filter query for transactions
+    const txQuery = { customerId: id };
+    if (txType && txType !== 'all') {
+      txQuery.type = txType;
+    }
+    if (txSearch && txSearch.trim()) {
+      txQuery.$or = [
+        { description: { $regex: txSearch.trim(), $options: 'i' } },
+        { performedBy: { $regex: txSearch.trim(), $options: 'i' } }
+      ];
+    }
+
+    // Fetch paginated transactions for this customer
+    const [transactions, txTotal] = await Promise.all([
+      db.collection('wallet_transactions')
+        .find(txQuery)
+        .sort({ createdAt: txSort })
+        .skip(txSkip)
+        .limit(txLimit)
+        .toArray(),
+      db.collection('wallet_transactions').countDocuments(txQuery)
+    ]);
+
+    // Booking requests by this customer
+    const bookings = await db.collection('bookData')
+      .find({
+        $or: [
+          { phone: customer.phone },
+          { phone: { $in: customer.wallet?.phoneNumbers || [] } }
+        ]
+      })
+      .sort({ submittedAt: -1 })
+      .limit(20)
+      .toArray();
+
+    res.json({
+      customer: {
+        id: customer._id.toString(),
+        fullName: customer.fullName,
+        phone: customer.phone,
+        email: customer.email || null,
+        wallet: {
+          accountNumber: customer.wallet?.accountNumber || null,
+          balance: customer.wallet?.balance || 0,
+          phoneNumbers: customer.wallet?.phoneNumbers || [],
+          addedPhoneCount: customer.wallet?.addedPhoneCount || 0,
+          createdAt: customer.wallet?.createdAt || null
+        },
+        createdAt: customer.createdAt
+      },
+      transactions: transactions.map(t => ({
+        id: t._id.toString(),
+        type: t.type,
+        amount: t.amount,
+        oldBalance: t.oldBalance,
+        newBalance: t.newBalance,
+        description: t.description,
+        performedBy: t.performedBy || 'System',
+        status: t.status || 'completed',
+        createdAt: t.createdAt
+      })),
+      transactionsPagination: {
+        total: txTotal,
+        page: txPage,
+        limit: txLimit,
+        pages: Math.ceil(txTotal / txLimit) || 1
+      },
+      bookings: bookings.map(b => ({
+        id: b._id.toString(),
+        bookName: b.bookName || b.name,
+        bookDevice: b.bookDevice || b.device,
+        status: b.status || b.new || 'pending',
+        submittedAt: b.submittedAt || b.date
+      }))
+    });
+  } catch (error) {
+    console.error('[Admin User Detail Error]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/customer/admin/users/:id/transactions
+ * Fetch paginated transaction history for a specific customer with filter, sort and search.
+ */
+router.get('/admin/users/:id/transactions', authenticateAdmin, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const { id } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const type = req.query.type || '';
+    const sort = req.query.sort === 'asc' ? 1 : -1;
+    const search = req.query.search || '';
+    const skip = (page - 1) * limit;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid customer ID.' });
+    }
+
+    const txQuery = { customerId: id };
+    if (type && type !== 'all') {
+      txQuery.type = type;
+    }
+    if (search && search.trim()) {
+      txQuery.$or = [
+        { description: { $regex: search.trim(), $options: 'i' } },
+        { performedBy: { $regex: search.trim(), $options: 'i' } }
+      ];
+    }
+
+    const [transactions, total] = await Promise.all([
+      db.collection('wallet_transactions')
+        .find(txQuery)
+        .sort({ createdAt: sort })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
+      db.collection('wallet_transactions').countDocuments(txQuery)
+    ]);
+
+    res.json({
+      transactions: transactions.map(t => ({
+        id: t._id.toString(),
+        type: t.type,
+        amount: t.amount,
+        oldBalance: t.oldBalance,
+        newBalance: t.newBalance,
+        description: t.description,
+        performedBy: t.performedBy || 'System',
+        status: t.status || 'completed',
+        createdAt: t.createdAt
+      })),
+      pagination: {
+        total,
+        page,
+        limit,
+        pages: Math.ceil(total / limit) || 1
+      }
+    });
+  } catch (error) {
+    console.error('[Admin User Transactions Pagination Error]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/customer/admin/users/:id
+ * Admin hard-deletes a customer account and anonymises their transactions.
+ */
+router.delete('/admin/users/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid customer ID.' });
+    }
+
+    const customer = await db.collection('customers').findOne({ _id: new ObjectId(id) });
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found.' });
+    }
+
+    await db.collection('customers').deleteOne({ _id: new ObjectId(id) });
+
+    // Anonymize related transactions
+    await db.collection('wallet_transactions').updateMany(
+      { customerId: id },
+      { $set: { customerAnonymized: true, customerName: '[Deleted by Admin]' } }
+    );
+
+    res.json({
+      success: true,
+      message: `Customer "${customer.fullName}" has been permanently deleted.`
+    });
+  } catch (error) {
+    console.error('[Admin Delete Customer Error]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/customer/admin/deletion-requests
+ * Fetch all account deletion requests submitted by users.
+ */
+router.get('/admin/deletion-requests', authenticateAdmin, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const requests = await db.collection('deletion_requests')
+      .find()
+      .sort({ requestedAt: -1 })
+      .toArray();
+
+    res.json(requests.map(r => ({
+      id: r._id.toString(),
+      identifier: r.identifier,
+      customerName: r.customerName || 'Unknown',
+      customerPhone: r.customerPhone || '—',
+      customerEmail: r.customerEmail || '—',
+      reason: r.reason || 'No reason provided',
+      status: r.status || 'pending',
+      requestedAt: r.requestedAt
+    })));
+  } catch (error) {
+    console.error('[Admin Deletion Requests Error]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * PATCH /api/customer/admin/deletion-requests/:id/status
+ * Update status of an account deletion request ('pending', 'processed', 'rejected').
+ */
+router.patch('/admin/deletion-requests/:id/status', authenticateAdmin, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid deletion request ID.' });
+    }
+
+    const validStatuses = ['pending', 'processed', 'rejected'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status.' });
+    }
+
+    await db.collection('deletion_requests').updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status, updatedAt: new Date() } }
+    );
+
+    res.json({ success: true, message: `Deletion request marked as ${status}.` });
+  } catch (error) {
+    console.error('[Admin Update Deletion Status Error]:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 module.exports = {
   router,
   authenticateCustomer,
