@@ -65,12 +65,19 @@ router.post("/login", async (req, res) => {
     const token = jwt.sign(
       { username: user.username, id: user._id },
       JWT_SECRET,
-      { expiresIn: "10h" }
+      { expiresIn: "24h" }
     );
     res.json({ token });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// GET /api/verify-token — lightweight endpoint to verify admin session validity.
+// The frontend calls this on page/tab focus to detect stale sessions early,
+// before the admin tries to perform an operation and gets a silent failure.
+router.get("/verify-token", authenticateToken, (req, res) => {
+  res.json({ valid: true, user: req.user });
 });
 
 // POST endpoint to receive data and save to MongoDB (protected)
@@ -503,6 +510,46 @@ router.get("/tvHomeRepairData", async (req, res) => {
   }
 });
 
+// PATCH /api/tvHomeRepairData/:id/status — Admin: Update TV Home Repair request status
+router.patch("/tvHomeRepairData/:id/status", async (req, res) => {
+  try {
+    const { ObjectId } = require('mongodb');
+    const db = await connectDB();
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid ID' });
+    const validStatuses = ['Pending', 'Technician Assigned', 'In Progress', 'Completed', 'Cancelled'];
+    if (!validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+
+    await db.collection("tvHomeRepairData").updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status, updatedAt: new Date() } }
+    );
+    res.json({ message: 'Status updated successfully', status });
+  } catch (error) {
+    console.error("Error updating TV home repair status:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/tvHomeRepairData/:id — Admin: Delete TV Home Repair request
+router.delete("/tvHomeRepairData/:id", async (req, res) => {
+  try {
+    const { ObjectId } = require('mongodb');
+    const db = await connectDB();
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid ID' });
+
+    await db.collection("tvHomeRepairData").deleteOne({ _id: new ObjectId(id) });
+    res.json({ message: 'TV Home Repair request deleted successfully' });
+  } catch (error) {
+    console.error("Error deleting TV home repair request:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.get("/bookData/:id", async (req, res) => {
   const { ObjectId } = require("mongodb");
   if (!ObjectId.isValid(req.params.id)) {
@@ -725,8 +772,9 @@ router.get("/dashboard-stats", async (req, res) => {
       .collection("repairData")
       .find({ new: "new" })
       .count();
+    const tvHome = await db.collection("tvHomeRepairData").countDocuments({ status: "Pending" });
     const subscribers = await db.collection("newsletter_subscribers").countDocuments();
-    res.status(200).json({ book, sell, repair, subscribers });
+    res.status(200).json({ book, sell, repair, tvHome, subscribers });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1267,6 +1315,7 @@ router.delete("/service-cards/:id", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
 
 // Change password (authenticated)
 router.post("/change-password", authenticateToken, async (req, res) => {

@@ -464,7 +464,7 @@ router.delete('/service-categories/:id', async (req, res) => {
 // SERVICE REQUESTS — Core entity
 // ═══════════════════════════════════════════════════════════════════
 
-// POST /service-requests — Receptionist or Partner registers customer + device escalation
+// POST /service-requests — Receptionist or Partner registers customer device (In-House or Escalation)
 router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
   try {
     const isPartner = req.staff.role === 'Partner';
@@ -475,13 +475,28 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
     }
 
     const db = await connectDB();
-    const { fullName, phoneNumber, email, deviceType, brandName, model, problemDescription, estimatedCost, repairExpense } = req.body;
+    const {
+      fullName,
+      phoneNumber,
+      email,
+      deviceType,
+      brandName,
+      model,
+      problemDescription,
+      estimatedCost,
+      repairExpense,
+      repairType,
+      isEscalation,
+      escalationReason,
+      imei,
+    } = req.body;
 
     if (!fullName || !phoneNumber || !deviceType || !brandName || !model || !problemDescription) {
       return res.status(400).json({ error: 'Full Name, Phone Number, Device Type, Brand Name, Model, and Problem Description are required' });
     }
 
     const trackingId = await generateTrackingId(db);
+    const shouldEscalate = isPartner && (isEscalation === true || repairType === 'escalation');
 
     const serviceRequest = {
       trackingId,
@@ -489,8 +504,8 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
       branchName: req.staff.branchName || null,
       partnerId: isPartner ? (req.staff.partnerId || req.staff.id).toString() : null,
       partnerName: isPartner ? (req.staff.businessName || req.staff.fullName) : null,
-      isPartnerEscalation: isPartner,
-      escalatedToAdmin: isPartner,
+      isPartnerEscalation: shouldEscalate,
+      escalatedToAdmin: shouldEscalate,
       partnerPayout: 0,
       customerInfo: {
         fullName: fullName.trim(),
@@ -502,18 +517,36 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
         brandName: brandName.trim(),
         model: model.trim(),
         problemDescription: problemDescription.trim(),
+        ...(imei ? { imei: imei.trim() } : {}),
       },
       diagnosis: null,
       serviceCards: [],
       totalCost: parseFloat(estimatedCost) || 0,
       repairExpense: parseFloat(repairExpense) || 0,
       paymentStatus: 'unpaid',
-      status: isPartner ? 'escalated_to_admin' : 'pending_diagnosis',
+      status: shouldEscalate ? 'escalated_to_admin' : 'pending_diagnosis',
       registeredBy: {
         id: req.staff.id.toString(),
         fullName: req.staff.fullName,
         role: req.staff.role,
       },
+      ...(shouldEscalate
+        ? {
+            escalation: {
+              isEscalated: true,
+              reason: escalationReason || problemDescription.trim(),
+              escalatedBy: {
+                id: req.staff.id.toString(),
+                partnerId: (req.staff.partnerId || req.staff.id).toString(),
+                name: req.staff.businessName || req.staff.fullName || 'Partner',
+                role: 'Partner',
+                type: 'partner',
+              },
+              escalatedAt: new Date(),
+              status: 'pending_admin_action',
+            },
+          }
+        : {}),
       createdAt: new Date(),
       updatedAt: new Date(),
       paidAt: null,
@@ -522,7 +555,7 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
     const result = await db.collection('service_requests').insertOne(serviceRequest);
 
     res.status(201).json({
-      message: isPartner ? 'Device escalated to Admin successfully' : 'Service request registered successfully',
+      message: shouldEscalate ? 'Device escalated to Admin successfully' : 'Service request registered successfully',
       serviceRequest: {
         id: result.insertedId.toString(),
         trackingId,
@@ -539,31 +572,46 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
 router.get('/service-requests', authenticateBranchStaff, async (req, res) => {
   try {
     const db = await connectDB();
-    const filter = {};
+    const conditions = [];
 
     // Staff/Partner can only see their own branch/partner requests
     if (req.staff.role === 'Partner') {
       const pid = (req.staff.partnerId || req.staff.id).toString();
-      filter.$or = [
-        { partnerId: pid },
-        { 'registeredBy.id': pid }
-      ];
+      conditions.push({
+        $or: [
+          { partnerId: pid },
+          { 'registeredBy.id': pid },
+          { 'escalation.escalatedBy.partnerId': pid },
+          { 'escalation.escalatedBy.id': pid },
+        ],
+      });
     } else if (req.staff.branchId) {
-      filter.branchId = req.staff.branchId;
+      const bid = req.staff.branchId.toString();
+      conditions.push({
+        $or: [
+          { branchId: bid },
+          { 'escalation.escalatedBy.branchId': bid },
+          { 'escalation.escalatedBy.id': bid },
+        ],
+      });
     }
 
-    if (req.query.status) filter.status = req.query.status;
-    if (req.query.paymentStatus) filter.paymentStatus = req.query.paymentStatus;
+    if (req.query.status) conditions.push({ status: req.query.status });
+    if (req.query.paymentStatus) conditions.push({ paymentStatus: req.query.paymentStatus });
     if (req.query.search) {
       const search = req.query.search.trim();
-      filter.$or = [
-        { trackingId: { $regex: search, $options: 'i' } },
-        { 'customerInfo.fullName': { $regex: search, $options: 'i' } },
-        { 'customerInfo.phoneNumber': { $regex: search, $options: 'i' } },
-        { 'deviceInfo.brandName': { $regex: search, $options: 'i' } },
-        { 'deviceInfo.model': { $regex: search, $options: 'i' } },
-      ];
+      conditions.push({
+        $or: [
+          { trackingId: { $regex: search, $options: 'i' } },
+          { 'customerInfo.fullName': { $regex: search, $options: 'i' } },
+          { 'customerInfo.phoneNumber': { $regex: search, $options: 'i' } },
+          { 'deviceInfo.brandName': { $regex: search, $options: 'i' } },
+          { 'deviceInfo.model': { $regex: search, $options: 'i' } },
+        ],
+      });
     }
+
+    const filter = conditions.length > 1 ? { $and: conditions } : (conditions[0] || {});
 
     const requests = await db.collection('service_requests').find(filter).sort({ createdAt: -1 }).toArray();
 
@@ -678,25 +726,51 @@ router.get('/track/:trackingId', async (req, res) => {
     const r = await db.collection('service_requests').findOne({ trackingId });
     if (!r) return res.status(404).json({ error: 'No repair found for this tracking ID. Please check the ID and try again.' });
 
-    // Map internal status to friendly customer-facing steps
-    const statusSteps = ['received', 'diagnosed', 'repairing', 'quality_check', 'ready'];
-    const statusLabels = {
-      received: 'Received',
-      diagnosed: 'Diagnosed',
-      repairing: 'Under Repair',
-      quality_check: 'Quality Check',
-      ready: 'Ready for Pickup',
-      completed: 'Completed',
-      cancelled: 'Cancelled',
+    // ── Map every internal status → customer-facing step index ──────────────
+    // Internal statuses lifecycle:
+    //   pending_diagnosis → diagnosed → serviced (cards added) → repairing → quality_check → ready → completed
+    //   escalated_to_admin / pending_admin_action / pending_admin_review → treated as step 0 (received/processing)
+    const statusToStep = {
+      pending_diagnosis:    0,   // just received, awaiting technician assessment
+      escalated_to_admin:   0,   // escalated but still at intake stage
+      pending_admin_action: 0,   // admin needs to act — device is in shop
+      pending_admin_review: 0,
+      escalated:            0,
+      open_for_bids:        0,
+      broadcasted:          0,
+      diagnosed:            1,   // technician has assessed
+      serviced:             2,   // service cards added, actively being repaired
+      repairing:            2,   // explicit repairing status
+      quality_check:        3,   // repair done, in QC
+      ready:                4,   // ready for customer pickup
+      completed:            4,   // collected
     };
-    const currentStep = statusSteps.indexOf(r.status);
+
+    const statusLabels = {
+      pending_diagnosis:    'Received — Awaiting Diagnosis',
+      escalated_to_admin:   'Received — Under Review',
+      pending_admin_action: 'Received — Processing',
+      pending_admin_review: 'Received — Under Review',
+      escalated:            'Received — Under Review',
+      open_for_bids:        'Received — Processing',
+      broadcasted:          'Received — Processing',
+      diagnosed:            'Diagnosed',
+      serviced:             'Under Repair',
+      repairing:            'Under Repair',
+      quality_check:        'Quality Check',
+      ready:                'Ready for Pickup',
+      completed:            'Completed — Collected',
+      cancelled:            'Cancelled',
+    };
+
+    const currentStep = statusToStep[r.status] ?? 0;
 
     res.json({
       trackingId: r.trackingId,
       status: r.status,
       statusLabel: statusLabels[r.status] || r.status,
-      currentStep: currentStep >= 0 ? currentStep : 0,
-      totalSteps: statusSteps.length,
+      currentStep,
+      totalSteps: 5,
       deviceSummary: r.deviceInfo ? `${r.deviceInfo.brand || ''} ${r.deviceInfo.model || ''}`.trim() : 'Device',
       branchName: r.branchName || 'MOCOS Branch',
       createdAt: r.createdAt,
@@ -959,6 +1033,71 @@ router.put('/service-requests/:id/mark-paid', authenticateBranchStaff, async (re
   }
 });
 
+// PUT /service-requests/:id/status — Technician or Partner updates repair status
+router.put('/service-requests/:id/status', authenticateBranchStaff, async (req, res) => {
+  try {
+    const { status, note } = req.body;
+    const validStatuses = [
+      'pending_diagnosis',
+      'diagnosed',
+      'serviced',
+      'repairing',
+      'quality_check',
+      'ready',
+      'completed',
+      'cancelled',
+    ];
+
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+    }
+
+    const db = await connectDB();
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid service request ID' });
+
+    const request = await db.collection('service_requests').findOne({ _id: new ObjectId(id) });
+    if (!request) return res.status(404).json({ error: 'Service request not found' });
+
+    const updateDoc = {
+      status,
+      updatedAt: new Date(),
+      lastStatusUpdatedBy: {
+        id: req.staff.id.toString(),
+        fullName: req.staff.fullName,
+        role: req.staff.role,
+      },
+    };
+
+    if (status === 'completed' && !request.completedAt) {
+      updateDoc.completedAt = new Date();
+    }
+    if (status === 'cancelled' && !request.cancelledAt) {
+      updateDoc.cancelledAt = new Date();
+    }
+
+    await db.collection('service_requests').updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: updateDoc,
+        $push: {
+          statusTimeline: {
+            status,
+            changedAt: new Date(),
+            changedBy: req.staff.fullName,
+            note: note || '',
+          },
+        },
+      }
+    );
+
+    res.json({ message: `Status updated to ${status}`, status });
+  } catch (error) {
+    console.error('Error updating service request status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // POST /service-requests/forward-web-request — Forward web booking/repair request to Branch or Partner
 router.post('/forward-web-request', async (req, res) => {
   try {
@@ -969,15 +1108,18 @@ router.post('/forward-web-request', async (req, res) => {
       return res.status(400).json({ error: 'requestId, requestType, targetType, and targetId are required' });
     }
 
-    if (!['booking', 'remote'].includes(requestType)) {
-      return res.status(400).json({ error: 'requestType must be booking or remote' });
+    if (!['booking', 'remote', 'tv_home', 'tv_repair'].includes(requestType)) {
+      return res.status(400).json({ error: 'requestType must be booking, remote, or tv_home' });
     }
 
     if (!['branch', 'partner'].includes(targetType)) {
       return res.status(400).json({ error: 'targetType must be branch or partner' });
     }
 
-    const collectionName = requestType === 'booking' ? 'bookData' : 'repairData';
+    let collectionName = 'bookData';
+    if (requestType === 'remote') collectionName = 'repairData';
+    else if (requestType === 'tv_home' || requestType === 'tv_repair') collectionName = 'tvHomeRepairData';
+
     if (!ObjectId.isValid(requestId)) return res.status(400).json({ error: 'Invalid request ID' });
 
     const webReq = await db.collection(collectionName).findOne({ _id: new ObjectId(requestId) });
@@ -989,9 +1131,10 @@ router.post('/forward-web-request', async (req, res) => {
     const customerPhone = webReq.bookPhone || webReq.remotePhone || webReq.phone || '';
     const customerEmail = webReq.email || '';
 
-    const deviceName = webReq.bookDevice || webReq.remoteDevice || webReq.deviceModel || 'Device';
-    const serviceName = webReq.bookService || webReq.serviceType || 'Repair';
-    const problemDesc = webReq.bookProblem || webReq.remoteProblem || webReq.description || 'Web repair request';
+    const isTv = requestType === 'tv_home' || requestType === 'tv_repair';
+    const deviceName = isTv ? (webReq.tvBrand || 'TV') : (webReq.bookDevice || webReq.remoteDevice || webReq.deviceModel || 'Device');
+    const serviceName = isTv ? `${webReq.tvSize || 55}" TV In-Home Repair` : (webReq.bookService || webReq.serviceType || 'Repair');
+    const problemDesc = webReq.problem || webReq.bookProblem || webReq.remoteProblem || webReq.description || 'Web repair request';
 
     const serviceRequest = {
       trackingId,
@@ -1005,10 +1148,10 @@ router.post('/forward-web-request', async (req, res) => {
         email: customerEmail,
       },
       deviceInfo: {
-        deviceType: 'Smartphone',
+        deviceType: isTv ? 'TV' : 'Smartphone',
         brandName: deviceName,
         model: serviceName,
-        problemDescription: problemDesc,
+        problemDescription: `${problemDesc}${isTv && webReq.street ? ` (Location: ${webReq.street}, ${webReq.ward}, ${webReq.district}, ${webReq.region})` : ''}`.trim(),
       },
       diagnosis: null,
       serviceCards: [],

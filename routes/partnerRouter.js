@@ -74,9 +74,16 @@ router.get('/:id', async (req, res) => {
     let totalRevenue = 0;
     let totalExpenses = 0;
     let partnerTotalPayout = 0;
+    const partnerId = id;
 
     const formattedRequests = requests.map((r) => {
       const cards = r.serviceCards || [];
+      const revenue = r.totalCost || cards.reduce((sum, c) => sum + (c.spareCost || 0) + (c.serviceCost || 0), 0);
+      const expenses = r.repairExpense !== undefined
+        ? r.repairExpense
+        : cards.reduce((sum, c) => sum + (c.spareCostExpense || 0) + (c.serviceCostExpense || 0), 0);
+      const itemProfit = revenue - expenses;
+
       const isEscalated = !!r.escalation?.isEscalated;
       const isEscalator = isEscalated && (
         r.escalation?.escalatedBy?.partnerId?.toString() === partnerId ||
@@ -109,7 +116,7 @@ router.get('/:id', async (req, res) => {
         deviceInfo: r.deviceInfo,
         totalCost: revenue,
         repairExpense: expenses,
-        netProfit,
+        netProfit: itemProfit,
         partnerPayout,
         isPartnerEscalation: !!r.isPartnerEscalation,
         status: r.status,
