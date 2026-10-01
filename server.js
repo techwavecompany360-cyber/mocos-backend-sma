@@ -83,6 +83,11 @@ app.use('/api/staff-permissions', staffPermissionsRouter);
 app.use('/api/customers', customerProfileRouter);
 app.use('/before-after', express.static(path.join(__dirname, 'public/before-after')));
 
+// Server-side pre-rendered preview routes for WhatsApp/social sharing
+const shareRouter = require('./routes/shareRouter');
+app.use('/share', shareRouter);
+app.use('/api/share', shareRouter);
+
 // Health check endpoint for deployment monitoring
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', environment: process.env.NODE_ENV || 'development', timestamp: new Date() });
