@@ -52,8 +52,13 @@ const partnerRouter = require('./routes/partnerRouter');
 const chatRouter = require('./routes/chatRouter');
 const beforeAfterRouter = require('./routes/beforeAfterRouter');
 const depositRouter = require('./routes/depositRouter');
+const posRouter = require('./routes/posRouter');
+const staffPermissionsRouter = require('./routes/staffPermissionsRouter');
+const systemRouter = require('./routes/systemRouter');
+const customerProfileRouter = require('./routes/customerProfileRouter');
 
 app.use('/api', dataRouter);
+app.use('/api/system', systemRouter);
 app.use('/api/newsletter-subscribers', newsletterSubscribersRouter);
 app.use('/api/gallery', galleryRouter);
 app.use('/api/reports', reportsRouter);
@@ -73,6 +78,9 @@ app.use('/api/service-management', serviceManagementRouter);
 app.use('/api/chat', chatRouter);
 app.use('/api/before-after', beforeAfterRouter);
 app.use('/api/deposit', depositRouter);
+app.use('/api/pos', posRouter);
+app.use('/api/staff-permissions', staffPermissionsRouter);
+app.use('/api/customers', customerProfileRouter);
 app.use('/before-after', express.static(path.join(__dirname, 'public/before-after')));
 
 // Health check endpoint for deployment monitoring

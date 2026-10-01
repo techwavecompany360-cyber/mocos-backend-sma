@@ -62,12 +62,13 @@ router.post("/login", async (req, res) => {
     //   console.log(user);
     //   return res.status(401).json({ error: 'Invalid credentials' });
     // }
+    const role = user.role || "Admin";
     const token = jwt.sign(
-      { username: user.username, id: user._id },
+      { username: user.username, id: user._id, role },
       JWT_SECRET,
       { expiresIn: "24h" }
     );
-    res.json({ token });
+    res.json({ token, role, username: user.username });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -849,6 +850,45 @@ router.get("/bookData", async (req, res) => {
   }
 });
 
+async function processBase64Image(base64Str) {
+  if (!base64Str || typeof base64Str !== "string") return "";
+  if (!base64Str.startsWith("data:image/")) {
+    return base64Str;
+  }
+  try {
+    const matches = base64Str.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+    if (!matches || matches.length !== 3) {
+      return base64Str;
+    }
+    const mimeType = matches[1];
+    const base64Data = matches[2];
+    const imageBuffer = Buffer.from(base64Data, "base64");
+    const ext = mimeType.includes("png") ? "png" : mimeType.includes("webp") ? "webp" : "jpg";
+    const filename = `blog-img-${Date.now()}-${Math.round(Math.random() * 1e9)}.${ext}`;
+    const destPath = `blog-images/${filename}`;
+
+    try {
+      const gcsUrl = await gcsStorage.uploadFile(imageBuffer, destPath, mimeType);
+      if (gcsUrl) return gcsUrl;
+    } catch (gcsErr) {
+      console.warn("[GCS Warning] Failed to upload blog image to GCS, saving locally:", gcsErr.message);
+    }
+
+    // Fallback: save to public/uploads/blog/
+    const fs = require("fs");
+    const uploadDir = path.join(__dirname, "../public/uploads/blog");
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    const localFilePath = path.join(uploadDir, filename);
+    fs.writeFileSync(localFilePath, imageBuffer);
+    return `/public/uploads/blog/${filename}`;
+  } catch (err) {
+    console.error("Error processing base64 image:", err);
+    return "";
+  }
+}
+
 function parseMetadataFromHtml(html) {
   if (!html || typeof html !== "string") return {};
 
@@ -864,12 +904,14 @@ function parseMetadataFromHtml(html) {
   const titleMatch = html.match(/<h[1-2]>([\s\S]*?)<\/h[1-2]>/);
   const title = meta.title || (titleMatch ? titleMatch[1].replace(/<[^>]*>/g, "").trim() : "Untitled Post");
 
-  let featuredImage = meta.featuredImage || "";
-  if (!featuredImage) {
+  let rawFeaturedImage = meta.featuredImage || "";
+  if (!rawFeaturedImage) {
     const imgMatch = html.match(/<img[^>]+src=["']([^"']+)["']/);
-    featuredImage = imgMatch ? imgMatch[1] : "";
+    rawFeaturedImage = imgMatch ? imgMatch[1] : "";
   }
-  // Strip heavy base64 images from MongoDB metadata storage to preserve DB quota
+
+  let featuredImage = rawFeaturedImage;
+  // If base64, don't keep huge string in metadata; processBase64Image will resolve it to URL
   if (typeof featuredImage === "string" && featuredImage.startsWith("data:")) {
     featuredImage = "";
   }
@@ -887,6 +929,7 @@ function parseMetadataFromHtml(html) {
     summary,
     category: meta.category || "General",
     featuredImage,
+    rawFeaturedImage,
     readTime: meta.readTime || "3 min read",
     author: meta.author || "Mocos Team",
   };
@@ -902,10 +945,25 @@ router.post("/blogpost", async (req, res) => {
     }
 
     const meta = parseMetadataFromHtml(html);
+    let featuredImage = meta.featuredImage;
+    if (!featuredImage && meta.rawFeaturedImage) {
+      featuredImage = await processBase64Image(meta.rawFeaturedImage);
+    }
+
     const createdAt = new Date();
     const filename = `${createdAt.getTime()}-${Math.round(Math.random() * 1e9)}.html`;
     const destPath = `blogposts/${filename}`;
-    const url = await gcsStorage.uploadBuffer(html, destPath, "text/html");
+    let url = "";
+    try {
+      url = await gcsStorage.uploadBuffer(html, destPath, "text/html");
+    } catch (gcsErr) {
+      console.warn("[GCS Warning] Upload blogpost HTML failed, saving locally:", gcsErr.message);
+      const fs = require("fs");
+      const localDir = path.join(__dirname, "../public/uploads/blog");
+      if (!fs.existsSync(localDir)) fs.mkdirSync(localDir, { recursive: true });
+      fs.writeFileSync(path.join(localDir, filename), html);
+      url = `/public/uploads/blog/${filename}`;
+    }
 
     const doc = {
       url,
@@ -914,10 +972,11 @@ router.post("/blogpost", async (req, res) => {
       title: meta.title || "Untitled Post",
       summary: meta.summary || "No summary available.",
       category: meta.category || "General",
-      featuredImage: meta.featuredImage || "",
+      featuredImage: featuredImage || "",
       readTime: meta.readTime || "3 min read",
       author: meta.author || "Mocos Team",
       views: 0,
+      hidden: false,
     };
 
     const result = await db.collection("blogposts").insertOne(doc);
@@ -933,7 +992,7 @@ router.get("/blogpost", async (req, res) => {
     const db = await connectDB();
     const post = await db
       .collection("blogposts")
-      .find()
+      .find({ hidden: { $ne: true } })
       .sort({ createdAt: -1 })
       .limit(1)
       .next();
@@ -957,8 +1016,10 @@ router.get(["/blogposts", "/blog/posts"], async (req, res) => {
     const db = await connectDB();
     const limit = parseInt(req.query.limit) || 0;
     const page = parseInt(req.query.page) || 1;
+    const includeHidden = req.query.includeHidden === "true" || req.query.includeHidden === "1";
 
-    let query = db.collection("blogposts").find().sort({ createdAt: -1 });
+    let queryFilter = includeHidden ? {} : { hidden: { $ne: true } };
+    let query = db.collection("blogposts").find(queryFilter).sort({ createdAt: -1 });
     if (limit > 0) {
       query = query.skip((page - 1) * limit).limit(limit);
     }
@@ -973,20 +1034,34 @@ router.get(["/blogposts", "/blog/posts"], async (req, res) => {
       let readTime = post.readTime;
       let author = post.author;
 
-      // Lazy-extract & backfill metadata for legacy DB documents missing title/summary
-      if (!title || !summary) {
+      // Lazy-extract & backfill metadata for legacy DB documents missing title/summary/image
+      if (!title || !summary || !featuredImage) {
         try {
-          const gcsPath = post.gcsPath || (post.url && post.url.startsWith("http") ? gcsStorage.extractGcsPath(post.url) : `blogposts/${path.basename(post.url)}`);
+          const gcsPath = post.gcsPath || (post.url && post.url.startsWith("http") ? gcsStorage.extractGcsPath(post.url) : (post.url ? `blogposts/${path.basename(post.url)}` : null));
+          let html = "";
           if (gcsPath) {
-            const buffer = await gcsStorage.downloadFile(gcsPath);
-            const html = buffer.toString("utf8");
+            try {
+              const buffer = await gcsStorage.downloadFile(gcsPath);
+              html = buffer.toString("utf8");
+            } catch (e) {}
+          }
+          if (!html && post.url && !post.url.startsWith("http")) {
+            const fs = require("fs");
+            const localPath = path.join(__dirname, `..${post.url}`);
+            if (fs.existsSync(localPath)) html = fs.readFileSync(localPath, "utf8");
+          }
+
+          if (html) {
             const meta = parseMetadataFromHtml(html);
-            title = meta.title;
-            summary = meta.summary;
-            category = meta.category;
-            featuredImage = meta.featuredImage;
-            readTime = meta.readTime;
-            author = meta.author;
+            title = meta.title || title;
+            summary = meta.summary || summary;
+            category = meta.category || category;
+            readTime = meta.readTime || readTime;
+            author = meta.author || author;
+
+            if (!featuredImage && meta.rawFeaturedImage) {
+              featuredImage = await processBase64Image(meta.rawFeaturedImage);
+            }
 
             db.collection("blogposts").updateOne(
               { _id: post._id },
@@ -1009,6 +1084,7 @@ router.get(["/blogposts", "/blog/posts"], async (req, res) => {
         readTime: readTime || "3 min read",
         author: author || "Mocos Team",
         views: post.views || 0,
+        hidden: post.hidden || false,
       };
     }));
 
@@ -1147,11 +1223,123 @@ router.delete("/blogposts/:id", async (req, res) => {
     if (!post) {
       return res.status(404).json({ error: "Blog post not found" });
     }
-    const gcsPath = post.gcsPath || (post.url && post.url.startsWith("http") ? gcsStorage.extractGcsPath(post.url) : `blogposts/${path.basename(post.url)}`);
-    if (gcsPath) await gcsStorage.deleteFile(gcsPath);
+
+    const gcsPath = post.gcsPath || (post.url && post.url.startsWith("http") ? gcsStorage.extractGcsPath(post.url) : (post.url ? `blogposts/${path.basename(post.url)}` : null));
+    if (gcsPath) {
+      try {
+        await gcsStorage.deleteFile(gcsPath);
+      } catch (gcsErr) {
+        console.warn(`[GCS Warning] Could not delete GCS file (${gcsPath}):`, gcsErr.message);
+      }
+    }
+
+    // Also cleanup any uploaded featured image if it was hosted on GCS
+    if (post.featuredImage && typeof post.featuredImage === "string" && post.featuredImage.includes("blog-images/")) {
+      const imgGcsPath = gcsStorage.extractGcsPath(post.featuredImage);
+      if (imgGcsPath) {
+        try {
+          await gcsStorage.deleteFile(imgGcsPath);
+        } catch (e) {}
+      }
+    }
 
     await db.collection("blogposts").deleteOne({ _id: new ObjectId(id) });
-    res.json({ success: true });
+    res.json({ success: true, message: "Blog post deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT (update/edit) a blog post by id
+router.put("/blogposts/:id", async (req, res) => {
+  try {
+    const db = await connectDB();
+    const { id } = req.params;
+    const { ObjectId } = require("mongodb");
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid blog post id" });
+    }
+
+    const { html } = req.body;
+    if (!html || typeof html !== "string" || !html.trim()) {
+      return res.status(400).json({ error: "Blog post HTML content required" });
+    }
+
+    const existing = await db.collection("blogposts").findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({ error: "Blog post not found" });
+    }
+
+    const meta = parseMetadataFromHtml(html);
+    let featuredImage = meta.featuredImage;
+    if (!featuredImage && meta.rawFeaturedImage) {
+      featuredImage = await processBase64Image(meta.rawFeaturedImage);
+    }
+    if (!featuredImage && existing.featuredImage) {
+      featuredImage = existing.featuredImage;
+    }
+
+    let destPath = existing.gcsPath;
+    if (!destPath) {
+      destPath = `blogposts/${Date.now()}-${Math.round(Math.random() * 1e9)}.html`;
+    }
+    let url = existing.url;
+    try {
+      url = await gcsStorage.uploadBuffer(html, destPath, "text/html");
+    } catch (gcsErr) {
+      console.warn("[GCS Warning] Upload updated HTML failed, saving locally:", gcsErr.message);
+      const fs = require("fs");
+      const localDir = path.join(__dirname, "../public/uploads/blog");
+      if (!fs.existsSync(localDir)) fs.mkdirSync(localDir, { recursive: true });
+      fs.writeFileSync(path.join(localDir, path.basename(destPath)), html);
+      url = `/public/uploads/blog/${path.basename(destPath)}`;
+    }
+
+    const updateDoc = {
+      url,
+      gcsPath: destPath,
+      updatedAt: new Date(),
+      title: meta.title || existing.title || "Untitled Post",
+      summary: meta.summary || existing.summary || "No summary available.",
+      category: meta.category || existing.category || "General",
+      featuredImage: featuredImage || "",
+      readTime: meta.readTime || existing.readTime || "3 min read",
+      author: meta.author || existing.author || "Mocos Team",
+    };
+
+    await db.collection("blogposts").updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateDoc }
+    );
+
+    res.json({ id, ...updateDoc, success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PATCH toggle hide/unhide blog post
+router.patch("/blogposts/:id/visibility", async (req, res) => {
+  try {
+    const db = await connectDB();
+    const { id } = req.params;
+    const { ObjectId } = require("mongodb");
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid blog post id" });
+    }
+
+    const existing = await db.collection("blogposts").findOne({ _id: new ObjectId(id) });
+    if (!existing) {
+      return res.status(404).json({ error: "Blog post not found" });
+    }
+
+    const hidden = typeof req.body.hidden === "boolean" ? req.body.hidden : !existing.hidden;
+    await db.collection("blogposts").updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { hidden, updatedAt: new Date() } }
+    );
+
+    res.json({ success: true, id, hidden });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1293,6 +1481,34 @@ router.get("/service-cards", async (req, res) => {
     const db = await connectDB();
     const cards = await db.collection("service_cards").find().toArray();
     res.json(cards.map((card) => ({ id: card._id.toString(), ...card })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.put("/service-cards/:id", async (req, res) => {
+  try {
+    const { ObjectId } = require("mongodb");
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid service card ID" });
+    }
+    const updateData = { ...req.body };
+    delete updateData._id;
+    delete updateData.id;
+    updateData.updatedAt = new Date().toISOString();
+
+    const db = await connectDB();
+    const result = await db.collection("service_cards").findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: updateData },
+      { returnDocument: "after" }
+    );
+    const updatedDoc = result?.value || result;
+    if (!updatedDoc) {
+      return res.status(404).json({ error: "Service card not found" });
+    }
+    res.json({ id: (updatedDoc._id || id).toString(), ...updatedDoc });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

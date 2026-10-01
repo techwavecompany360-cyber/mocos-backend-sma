@@ -3,6 +3,7 @@ const { ObjectId } = require('mongodb');
 const jwt = require('jsonwebtoken');
 const connectDB = require('../utils/db');
 const config = require('../config');
+const { broadcastNotification } = require('../utils/notificationEmitter');
 
 const router = express.Router();
 const JWT_SECRET = config.JWT_SECRET;
@@ -14,7 +15,10 @@ function authenticateBranchStaff(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Access token required' });
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Invalid or expired session token' });
+    if (err) return res.status(401).json({ error: 'Invalid or expired session token' });
+    if (!user.role && (user.username || user.id)) {
+      user.role = 'Admin';
+    }
     req.staff = user;
     next();
   });
@@ -65,6 +69,12 @@ async function seedDefaults(db) {
 router.get('/financial-summary', authenticateBranchStaff, async (req, res) => {
   try {
     const db = await connectDB();
+
+    // STRICT: Only Admin or Partner can view financial reports for a branch
+    if (req.staff.role !== 'Admin' && req.staff.role !== 'Partner') {
+      return res.status(403).json({ error: 'Access denied. Only branch administrators can view branch financial reports.' });
+    }
+
     const filter = {};
     let userEntityId = null;
 
@@ -78,15 +88,51 @@ router.get('/financial-summary', authenticateBranchStaff, async (req, res) => {
       ];
     } else if (req.staff.branchId) {
       userEntityId = req.staff.branchId.toString();
+      const branchObjId = ObjectId.isValid(userEntityId) ? new ObjectId(userEntityId) : null;
       filter.$or = [
         { branchId: userEntityId },
+        ...(branchObjId ? [{ branchId: branchObjId }] : []),
         { 'escalation.escalatedBy.branchId': userEntityId },
         { 'escalation.escalatedBy.id': userEntityId }
       ];
     }
 
+    // ─── Advanced Date Filtering ─────────────────────────────────────
+    const period = req.query.period || 'all';
+    let dateFilter = null;
+    const now = new Date();
+
+    if (req.query.dateFrom || req.query.dateTo) {
+      dateFilter = {};
+      if (req.query.dateFrom) dateFilter.$gte = new Date(req.query.dateFrom);
+      if (req.query.dateTo) {
+        const to = new Date(req.query.dateTo);
+        to.setHours(23, 59, 59, 999);
+        dateFilter.$lte = to;
+      }
+    } else if (period && period !== 'all') {
+      let from = new Date();
+      if (period === 'today') {
+        from.setHours(0, 0, 0, 0);
+      } else if (period === 'this_week' || period === 'week') {
+        const day = now.getDay();
+        const diff = (day === 0 ? -6 : 1) - day;
+        from = new Date(now.getFullYear(), now.getMonth(), now.getDate() + diff, 0, 0, 0, 0);
+      } else if (period === 'this_month' || period === 'month') {
+        from = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+      } else if (period === 'this_year' || period === 'year') {
+        from = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0);
+      }
+      dateFilter = { $gte: from };
+    }
+
+    if (dateFilter) {
+      filter.createdAt = dateFilter;
+    }
+
     const requests = await db.collection('service_requests').find(filter).sort({ createdAt: -1 }).toArray();
     const summary = computeFinancials(requests, userEntityId);
+    summary.period = period;
     res.json(summary);
   } catch (error) {
     console.error('Error fetching financial summary:', error);
@@ -196,7 +242,9 @@ function authenticateAdmin(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Access token required' });
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ error: 'Invalid or expired token' });
+    if (!user.role) user.role = 'Admin';
     req.user = user;
+    req.staff = user;
     next();
   });
 }
@@ -469,9 +517,10 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
   try {
     const isPartner = req.staff.role === 'Partner';
     const isReceptionist = req.staff.role === 'Receptionist';
+    const isAdmin = req.staff.role === 'Admin';
 
-    if (!isReceptionist && !isPartner) {
-      return res.status(403).json({ error: 'Only Receptionists and Partners can register service requests' });
+    if (!isReceptionist && !isPartner && !isAdmin) {
+      return res.status(403).json({ error: 'Only Receptionists, Partners, or Admin can register service requests' });
     }
 
     const db = await connectDB();
@@ -496,7 +545,8 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
     }
 
     const trackingId = await generateTrackingId(db);
-    const shouldEscalate = isPartner && (isEscalation === true || repairType === 'escalation');
+    const shouldEscalate = (isPartner || isReceptionist || isAdmin) && (isEscalation === true || repairType === 'escalation');
+    const normalizedPhone = phoneNumber.trim().replace(/[\s\-\(\)\+]/g, '');
 
     const serviceRequest = {
       trackingId,
@@ -510,6 +560,7 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
       customerInfo: {
         fullName: fullName.trim(),
         phoneNumber: phoneNumber.trim(),
+        phoneNormalized: normalizedPhone,
         email: email ? email.trim().toLowerCase() : '',
       },
       deviceInfo: {
@@ -524,7 +575,7 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
       totalCost: parseFloat(estimatedCost) || 0,
       repairExpense: parseFloat(repairExpense) || 0,
       paymentStatus: 'unpaid',
-      status: shouldEscalate ? 'escalated_to_admin' : 'pending_diagnosis',
+      status: shouldEscalate ? 'escalated' : 'pending_diagnosis',
       registeredBy: {
         id: req.staff.id.toString(),
         fullName: req.staff.fullName,
@@ -534,16 +585,35 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
         ? {
             escalation: {
               isEscalated: true,
-              reason: escalationReason || problemDescription.trim(),
-              escalatedBy: {
-                id: req.staff.id.toString(),
-                partnerId: (req.staff.partnerId || req.staff.id).toString(),
-                name: req.staff.businessName || req.staff.fullName || 'Partner',
-                role: 'Partner',
-                type: 'partner',
+              reason: escalationReason ? escalationReason.trim() : problemDescription.trim(),
+              privateInfo: {
+                expectedPrice: parseFloat(estimatedCost) || 0,
+                message: escalationReason ? escalationReason.trim() : problemDescription.trim(),
               },
-              escalatedAt: new Date(),
+              escalatedBy: {
+                id: (req.staff.partnerId || req.staff.branchId || req.staff.id).toString(),
+                name: req.staff.businessName || req.staff.branchName || req.staff.fullName || (isPartner ? 'Partner' : 'Branch Staff'),
+                role: req.staff.role,
+                branchId: req.staff.branchId || null,
+                partnerId: req.staff.partnerId || (isPartner ? req.staff.id : null),
+              },
+              createdAt: new Date(),
               status: 'pending_admin_action',
+              broadcast: null,
+              partnerAFee: 0,
+              partnerBTotalCost: 0,
+              partnerBFee: 0,
+              adminFee: 0,
+              cancellation: null,
+              paymentChain: {
+                customerPaid: false,
+                partnerBPayAdminStatus: 'none',
+                partnerBPaidAt: null,
+                adminAckPartnerBAt: null,
+                adminPayPartnerAStatus: 'none',
+                adminPaidPartnerAAt: null,
+                partnerAAckAt: null,
+              },
             },
           }
         : {}),
@@ -552,7 +622,40 @@ router.post('/service-requests', authenticateBranchStaff, async (req, res) => {
       paidAt: null,
     };
 
+    // ── Unified Customer Identity: find-or-create customer profile ──
+    try {
+      let customerProfile = await db.collection('customers').findOne({ 'phoneNumbers.normalized': normalizedPhone });
+      if (!customerProfile) {
+        const now = new Date();
+        const newCustomer = {
+          primaryName: fullName.trim(),
+          primaryEmail: email ? email.trim().toLowerCase() : '',
+          phoneNumbers: [{ number: phoneNumber.trim(), normalized: normalizedPhone, label: 'primary', addedAt: now }],
+          notes: '',
+          tags: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+        const cr = await db.collection('customers').insertOne(newCustomer);
+        newCustomer._id = cr.insertedId;
+        customerProfile = newCustomer;
+      }
+      serviceRequest.customerId = customerProfile._id.toString();
+    } catch (profileErr) {
+      console.warn('Warning: Could not link customer profile:', profileErr.message);
+    }
+
     const result = await db.collection('service_requests').insertOne(serviceRequest);
+
+    if (shouldEscalate) {
+      broadcastNotification({
+        type: 'escalation',
+        title: '⚡️ New Escalated Device Registered',
+        message: `${req.staff.businessName || req.staff.branchName || req.staff.fullName} registered an escalated repair: ${brandName} ${model} (Tracking #${trackingId})`,
+        link: '/network-broadcast',
+        data: { trackingId, brandName, model },
+      }).catch(err => console.error('[Notification] Error broadcasting escalation:', err.message));
+    }
 
     res.status(201).json({
       message: shouldEscalate ? 'Device escalated to Admin successfully' : 'Service request registered successfully',
@@ -771,7 +874,7 @@ router.get('/track/:trackingId', async (req, res) => {
       statusLabel: statusLabels[r.status] || r.status,
       currentStep,
       totalSteps: 5,
-      deviceSummary: r.deviceInfo ? `${r.deviceInfo.brand || ''} ${r.deviceInfo.model || ''}`.trim() : 'Device',
+      deviceSummary: r.deviceInfo ? `${r.deviceInfo.brandName || r.deviceInfo.brand || ''} ${r.deviceInfo.model || ''}`.trim() : 'Device',
       branchName: r.branchName || 'MOCOS Branch',
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
@@ -818,8 +921,8 @@ router.get('/service-requests/track/:trackingId', authenticateBranchStaff, async
 // PUT /service-requests/:id/diagnosis — Technician or Partner saves diagnostic details
 router.put('/service-requests/:id/diagnosis', authenticateBranchStaff, async (req, res) => {
   try {
-    if (req.staff.role !== 'Technician' && req.staff.role !== 'Partner') {
-      return res.status(403).json({ error: 'Only Technicians or Partners can add diagnosis information' });
+    if (req.staff.role !== 'Technician' && req.staff.role !== 'Partner' && req.staff.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only Technicians, Partners, or Admin can add diagnosis information' });
     }
 
     const db = await connectDB();
@@ -853,11 +956,32 @@ router.put('/service-requests/:id/diagnosis', authenticateBranchStaff, async (re
   }
 });
 
-// POST /service-requests/:id/service-cards — Technician or Partner adds a service card entry
+// ── Helper: calculate total cost preserving escalation fees ──
+function calculateTotalCostWithEscalation(request, cards) {
+  const cardsTotal = cards.reduce((sum, c) => sum + (Number(c.spareCost) || 0) + (Number(c.serviceCost) || 0), 0);
+  if (request.escalation?.isEscalated && (request.escalation?.partnerBFee !== undefined || request.escalation?.broadcast?.status === 'awarded' || request.escalation?.status === 'admin_solving')) {
+    const pAFee = Number(request.escalation.partnerAFee) || 0;
+    const adminFee = Number(request.escalation.adminFee) || 0;
+    const initialPBFee = Number(request.escalation.partnerBFee) || 0;
+    const finalPBFee = Math.max(initialPBFee, cardsTotal);
+    return {
+      totalCost: pAFee + adminFee + finalPBFee,
+      partnerBFee: finalPBFee,
+      cardsTotal,
+    };
+  }
+  return {
+    totalCost: cardsTotal,
+    partnerBFee: null,
+    cardsTotal,
+  };
+}
+
+// POST /service-requests/:id/service-cards — Technician, Partner or Admin adds a service card entry
 router.post('/service-requests/:id/service-cards', authenticateBranchStaff, async (req, res) => {
   try {
-    if (req.staff.role !== 'Technician' && req.staff.role !== 'Partner') {
-      return res.status(403).json({ error: 'Only Technicians or Partners can add service cards' });
+    if (req.staff.role !== 'Technician' && req.staff.role !== 'Partner' && req.staff.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only Technicians, Partners, or Admin can add service cards' });
     }
 
     const db = await connectDB();
@@ -878,33 +1002,37 @@ router.post('/service-requests/:id/service-cards', authenticateBranchStaff, asyn
       spareCostExpense: Number(spareCostExpense) || 0,
       serviceCostExpense: Number(serviceCostExpense) || 0,
       description: description ? description.trim() : '',
-      addedBy: { id: req.staff.id, fullName: req.staff.fullName },
+      addedBy: { id: req.staff.id, fullName: req.staff.fullName || 'Staff' },
       addedAt: new Date(),
     };
 
-    // Push the service card and update total cost + status
     const request = await db.collection('service_requests').findOne({ _id: new ObjectId(id) });
     if (!request) return res.status(404).json({ error: 'Service request not found' });
 
     const updatedCards = [...(request.serviceCards || []), serviceCard];
-    const totalCost = updatedCards.reduce((sum, c) => sum + (c.spareCost || 0) + (c.serviceCost || 0), 0);
+    const costCalc = calculateTotalCostWithEscalation(request, updatedCards);
+
+    const updateDoc = {
+      serviceCards: updatedCards,
+      totalCost: costCalc.totalCost,
+      status: 'serviced',
+      updatedAt: new Date(),
+    };
+
+    if (costCalc.partnerBFee !== null) {
+      updateDoc['escalation.partnerBFee'] = costCalc.partnerBFee;
+      updateDoc['escalation.partnerBTotalCost'] = costCalc.cardsTotal;
+    }
 
     await db.collection('service_requests').updateOne(
       { _id: new ObjectId(id) },
-      {
-        $set: {
-          serviceCards: updatedCards,
-          totalCost,
-          status: 'serviced',
-          updatedAt: new Date(),
-        },
-      }
+      { $set: updateDoc }
     );
 
     res.status(201).json({
       message: 'Service card added successfully',
       serviceCard,
-      totalCost,
+      totalCost: costCalc.totalCost,
     });
   } catch (error) {
     console.error('Error adding service card:', error);
@@ -915,8 +1043,8 @@ router.post('/service-requests/:id/service-cards', authenticateBranchStaff, asyn
 // PUT /service-requests/:id/service-cards/:cardIndex — Update a service card
 router.put('/service-requests/:id/service-cards/:cardIndex', authenticateBranchStaff, async (req, res) => {
   try {
-    if (req.staff.role !== 'Technician') {
-      return res.status(403).json({ error: 'Only Technicians can update service cards' });
+    if (req.staff.role !== 'Technician' && req.staff.role !== 'Partner' && req.staff.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only Technicians, Partners, or Admin can update service cards' });
     }
 
     const db = await connectDB();
@@ -944,14 +1072,24 @@ router.put('/service-requests/:id/service-cards/:cardIndex', authenticateBranchS
       updatedAt: new Date(),
     };
 
-    const totalCost = request.serviceCards.reduce((sum, c) => sum + (c.spareCost || 0) + (c.serviceCost || 0), 0);
+    const costCalc = calculateTotalCostWithEscalation(request, request.serviceCards);
+    const updateDoc = {
+      serviceCards: request.serviceCards,
+      totalCost: costCalc.totalCost,
+      updatedAt: new Date(),
+    };
+
+    if (costCalc.partnerBFee !== null) {
+      updateDoc['escalation.partnerBFee'] = costCalc.partnerBFee;
+      updateDoc['escalation.partnerBTotalCost'] = costCalc.cardsTotal;
+    }
 
     await db.collection('service_requests').updateOne(
       { _id: new ObjectId(id) },
-      { $set: { serviceCards: request.serviceCards, totalCost, updatedAt: new Date() } }
+      { $set: updateDoc }
     );
 
-    res.json({ message: 'Service card updated successfully', totalCost });
+    res.json({ message: 'Service card updated successfully', totalCost: costCalc.totalCost });
   } catch (error) {
     console.error('Error updating service card:', error);
     res.status(500).json({ error: error.message });
@@ -961,8 +1099,8 @@ router.put('/service-requests/:id/service-cards/:cardIndex', authenticateBranchS
 // DELETE /service-requests/:id/service-cards/:cardIndex — Delete a service card
 router.delete('/service-requests/:id/service-cards/:cardIndex', authenticateBranchStaff, async (req, res) => {
   try {
-    if (req.staff.role !== 'Technician' && req.staff.role !== 'Partner') {
-      return res.status(403).json({ error: 'Only Technicians or Partners can delete service cards' });
+    if (req.staff.role !== 'Technician' && req.staff.role !== 'Partner' && req.staff.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only Technicians, Partners, or Admin can delete service cards' });
     }
 
     const db = await connectDB();
@@ -977,30 +1115,41 @@ router.delete('/service-requests/:id/service-cards/:cardIndex', authenticateBran
     }
 
     request.serviceCards.splice(idx, 1);
-    const totalCost = request.serviceCards.reduce((sum, c) => sum + (c.spareCost || 0) + (c.serviceCost || 0), 0);
+    const costCalc = calculateTotalCostWithEscalation(request, request.serviceCards);
 
-    // If no service cards left, revert status
     const status = request.serviceCards.length === 0
       ? (request.diagnosis ? 'diagnosed' : 'pending_diagnosis')
       : 'serviced';
 
+    const updateDoc = {
+      serviceCards: request.serviceCards,
+      totalCost: costCalc.totalCost,
+      status,
+      updatedAt: new Date(),
+    };
+
+    if (costCalc.partnerBFee !== null) {
+      updateDoc['escalation.partnerBFee'] = costCalc.partnerBFee;
+      updateDoc['escalation.partnerBTotalCost'] = costCalc.cardsTotal;
+    }
+
     await db.collection('service_requests').updateOne(
       { _id: new ObjectId(id) },
-      { $set: { serviceCards: request.serviceCards, totalCost, status, updatedAt: new Date() } }
+      { $set: updateDoc }
     );
 
-    res.json({ message: 'Service card deleted successfully', totalCost });
+    res.json({ message: 'Service card deleted successfully', totalCost: costCalc.totalCost });
   } catch (error) {
     console.error('Error deleting service card:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// PUT /service-requests/:id/mark-paid — Receptionist or Partner marks as paid
+// PUT /service-requests/:id/mark-paid — Receptionist, Partner, or Admin marks as paid
 router.put('/service-requests/:id/mark-paid', authenticateBranchStaff, async (req, res) => {
   try {
-    if (req.staff.role !== 'Receptionist' && req.staff.role !== 'Partner') {
-      return res.status(403).json({ error: 'Only Receptionists or Partners can mark service requests as paid' });
+    if (req.staff.role !== 'Receptionist' && req.staff.role !== 'Partner' && req.staff.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only Receptionists, Partners, or Admin can mark service requests as paid' });
     }
 
     const db = await connectDB();
@@ -1014,17 +1163,36 @@ router.put('/service-requests/:id/mark-paid', authenticateBranchStaff, async (re
       return res.status(400).json({ error: 'This service request is already marked as paid' });
     }
 
+    const isAdmin = req.staff.role === 'Admin';
+    const updateDoc = {
+      paymentStatus: 'paid',
+      paidAt: new Date(),
+      paidBy: { id: req.staff.id, fullName: req.staff.fullName || (isAdmin ? 'Admin' : 'Staff') },
+      updatedAt: new Date(),
+    };
+
+    if (request.escalation?.isEscalated) {
+      updateDoc['escalation.paymentChain.customerPaid'] = true;
+      updateDoc['escalation.paymentChain.customerPaidAt'] = new Date();
+      if (isAdmin) {
+        updateDoc['escalation.paymentChain.partnerBPayAdminStatus'] = 'confirmed';
+        updateDoc['escalation.paymentChain.adminPayPartnerAStatus'] = 'confirmed';
+        updateDoc['escalation.paymentChain.settledByAdminAt'] = new Date();
+      }
+    }
+
     await db.collection('service_requests').updateOne(
       { _id: new ObjectId(id) },
-      {
-        $set: {
-          paymentStatus: 'paid',
-          paidAt: new Date(),
-          paidBy: { id: req.staff.id, fullName: req.staff.fullName },
-          updatedAt: new Date(),
-        },
-      }
+      { $set: updateDoc }
     );
+
+    broadcastNotification({
+      type: 'payment',
+      title: '💳 Payment Received',
+      message: `${req.staff.fullName || req.staff.role} marked job #${request.trackingId} as PAID (TZS ${(request.totalCost || 0).toLocaleString()})`,
+      link: '/services',
+      data: { trackingId: request.trackingId, totalCost: request.totalCost }
+    }).catch(() => {});
 
     res.json({ message: 'Service request marked as paid successfully' });
   } catch (error) {
@@ -1224,6 +1392,7 @@ router.post('/service-requests/:id/escalate', authenticateBranchStaff, async (re
     const request = await db.collection('service_requests').findOne({ _id: new ObjectId(id) });
     if (!request) return res.status(404).json({ error: 'Service request not found' });
 
+    const isPartner = req.staff.role === 'Partner';
     const escalationData = {
       isEscalated: true,
       reason: reason.trim(),
@@ -1233,17 +1402,18 @@ router.post('/service-requests/:id/escalate', authenticateBranchStaff, async (re
         message: message ? message.trim() : (reason ? reason.trim() : ''),
       },
       escalatedBy: {
-        id: (req.staff.partnerId || req.staff.id).toString(),
-        name: req.staff.businessName || req.staff.fullName || 'Staff/Partner',
+        id: (req.staff.partnerId || req.staff.branchId || req.staff.id).toString(),
+        name: req.staff.businessName || req.staff.branchName || req.staff.fullName || (isPartner ? 'Partner' : 'Branch Staff'),
         role: req.staff.role,
         branchId: req.staff.branchId || null,
-        partnerId: req.staff.partnerId || (req.staff.role === 'Partner' ? req.staff.id : null),
+        partnerId: req.staff.partnerId || (isPartner ? req.staff.id : null),
       },
       createdAt: new Date(),
       status: 'pending_admin_action',
       broadcast: null,
       partnerAFee: 0,
       partnerBTotalCost: 0,
+      partnerBFee: 0,
       adminFee: 0,
       cancellation: null,
       paymentChain: {
@@ -1262,11 +1432,21 @@ router.post('/service-requests/:id/escalate', authenticateBranchStaff, async (re
       {
         $set: {
           escalation: escalationData,
+          isPartnerEscalation: true,
+          escalatedToAdmin: true,
           status: 'escalated',
           updatedAt: new Date(),
         },
       }
     );
+
+    broadcastNotification({
+      type: 'escalation',
+      title: '⚡️ Job Escalated to Admin HQ',
+      message: `${req.staff.businessName || req.staff.branchName || req.staff.fullName} escalated ${request.deviceInfo?.brandName || request.deviceInfo?.brand || ''} ${request.deviceInfo?.model || ''} (Tracking #${request.trackingId})`,
+      link: '/network-broadcast',
+      data: { trackingId: request.trackingId, reason: reason.trim() }
+    }).catch(() => {});
 
     res.json({ message: 'Request escalated to admin successfully', escalation: escalationData });
   } catch (error) {
@@ -1313,6 +1493,14 @@ router.post('/service-requests/:id/broadcast', authenticateAdmin, async (req, re
         },
       }
     );
+
+    broadcastNotification({
+      type: 'network_broadcast',
+      title: '📢 New Network Broadcast Available',
+      message: `Admin broadcasted a repair job for ${request.deviceInfo?.brandName || request.deviceInfo?.brand || ''} ${request.deviceInfo?.model || ''} to ${audience}`,
+      link: '/services',
+      data: { trackingId: request.trackingId, targetAudience: audience, adminOffer }
+    }).catch(() => {});
 
     res.json({ message: `Request broadcasted to ${audience} successfully`, broadcast: broadcastObj });
   } catch (error) {
@@ -1405,10 +1593,12 @@ router.post('/service-requests/:id/accept-broadcast', authenticateBranchStaff, a
     }
 
     const entityType = req.staff.role === 'Partner' ? 'partner' : 'branch';
-    const entityId = req.staff.role === 'Partner' ? (req.staff.partnerId || req.staff.id) : req.staff.branchId;
+    const entityId = req.staff.role === 'Partner'
+      ? (req.staff.partnerId || req.staff.id).toString()
+      : (req.staff.branchId ? req.staff.branchId.toString() : req.staff.id.toString());
     const entityName = req.staff.role === 'Partner'
       ? (req.staff.businessName || req.staff.fullName || 'Partner')
-      : (req.staff.branchName || 'Branch');
+      : (req.staff.branchName || req.staff.fullName || 'Branch');
 
     const bids = broadcast.candidateBids || [];
     const alreadyBid = bids.find(b => b.entityId === entityId);
@@ -1434,6 +1624,14 @@ router.post('/service-requests/:id/accept-broadcast', authenticateBranchStaff, a
         $set: { updatedAt: new Date() },
       }
     );
+
+    broadcastNotification({
+      type: 'broadcast_bid',
+      title: '✋ Broadcast Accepted by Candidate',
+      message: `${entityName} accepted broadcast for job #${request.trackingId} (Required: TZS ${(parseFloat(totalCostRequired) || 0).toLocaleString()})`,
+      link: '/network-broadcast',
+      data: { trackingId: request.trackingId, entityName, totalCostRequired }
+    }).catch(() => {});
 
     res.json({ message: 'Broadcast accepted successfully with total cost required. Admin will review and grant assignment.', bid: newBid });
   } catch (error) {
@@ -1490,6 +1688,14 @@ router.post('/service-requests/:id/grant-broadcast', authenticateAdmin, async (r
       { _id: new ObjectId(id) },
       { $set: updateFields }
     );
+
+    broadcastNotification({
+      type: 'broadcast_awarded',
+      title: '🏆 Broadcast Job Awarded',
+      message: `Job #${request.trackingId} was awarded to ${winnerEntityName || winnerEntityType} (Customer Total: TZS ${finalTotalCost.toLocaleString()})`,
+      link: '/services',
+      data: { trackingId: request.trackingId, winnerEntityName }
+    }).catch(() => {});
 
     res.json({
       message: `Job granted to ${winnerEntityName || winnerEntityType} successfully! Total Customer Price: TZS ${finalTotalCost.toLocaleString()} (Partner A: ${finalPartnerAFee.toLocaleString()} + Admin: ${finalAdminFee.toLocaleString()} + Partner B: ${finalPartnerBFee.toLocaleString()})`,
@@ -1572,6 +1778,14 @@ router.post('/service-requests/:id/admin-solve', authenticateAdmin, async (req, 
       }
     );
 
+    broadcastNotification({
+      type: 'admin_solve',
+      title: '🛠 In-House Repair Assigned',
+      message: `Admin assigned escalated job #${request.trackingId} for in-house repair at Head Office`,
+      link: '/services',
+      data: { trackingId: request.trackingId }
+    }).catch(() => {});
+
     res.json({ message: 'Admin accepted & assigned job to in-house repair team', partnerAFee: finalPartnerAFee });
   } catch (error) {
     console.error('Error in admin direct solve:', error);
@@ -1587,6 +1801,9 @@ router.post('/service-requests/:id/cancel-escalation', authenticateAdmin, async 
     const { reason } = req.body;
 
     if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid service request ID' });
+
+    const request = await db.collection('service_requests').findOne({ _id: new ObjectId(id) });
+    if (!request) return res.status(404).json({ error: 'Service request not found' });
 
     await db.collection('service_requests').updateOne(
       { _id: new ObjectId(id) },
@@ -1605,6 +1822,14 @@ router.post('/service-requests/:id/cancel-escalation', authenticateAdmin, async 
       }
     );
 
+    broadcastNotification({
+      type: 'escalation_cancelled',
+      title: '🚫 Escalated Job Cancelled',
+      message: `Admin cancelled escalated job #${request.trackingId}: ${reason ? reason.trim() : 'Cancelled by Admin'}`,
+      link: '/services',
+      data: { trackingId: request.trackingId }
+    }).catch(() => {});
+
     res.json({ message: 'Escalated job cancelled and closed by Admin' });
   } catch (error) {
     console.error('Error cancelling escalation:', error);
@@ -1612,7 +1837,7 @@ router.post('/service-requests/:id/cancel-escalation', authenticateAdmin, async 
   }
 });
 
-// 8. POST /service-requests/:id/request-cancel-escalation — Partner A requests cancellation from Admin
+// 8. POST /service-requests/:id/request-cancel-escalation — Partner or Branch requests cancellation from Admin
 router.post('/service-requests/:id/request-cancel-escalation', authenticateBranchStaff, async (req, res) => {
   try {
     const db = await connectDB();
@@ -1622,9 +1847,15 @@ router.post('/service-requests/:id/request-cancel-escalation', authenticateBranc
     if (!ObjectId.isValid(id)) return res.status(400).json({ error: 'Invalid service request ID' });
     if (!reason || !reason.trim()) return res.status(400).json({ error: 'Reason for cancellation request is required' });
 
+    const request = await db.collection('service_requests').findOne({ _id: new ObjectId(id) });
+    if (!request) return res.status(404).json({ error: 'Service request not found' });
+
+    const isPartner = req.staff.role === 'Partner';
     const cancellationObj = {
-      requestedBy: 'partner',
-      partnerId: req.staff.partnerId || req.staff.id,
+      requestedBy: isPartner ? 'partner' : 'branch',
+      partnerId: isPartner ? (req.staff.partnerId || req.staff.id) : null,
+      branchId: !isPartner ? (req.staff.branchId || req.staff.id) : null,
+      entityName: req.staff.businessName || req.staff.branchName || req.staff.fullName,
       partnerName: req.staff.businessName || req.staff.fullName,
       reason: reason.trim(),
       status: 'pending_admin_review',
@@ -1640,6 +1871,14 @@ router.post('/service-requests/:id/request-cancel-escalation', authenticateBranc
         },
       }
     );
+
+    broadcastNotification({
+      type: 'escalation_cancel_request',
+      title: '⚠️ Cancellation Requested for Escalation',
+      message: `${cancellationObj.entityName} requested cancellation for job #${request.trackingId}: "${reason.trim()}"`,
+      link: '/network-broadcast',
+      data: { trackingId: request.trackingId, reason: reason.trim() }
+    }).catch(() => {});
 
     res.json({ message: 'Cancellation request submitted to Admin', cancellation: cancellationObj });
   } catch (error) {
@@ -1674,6 +1913,15 @@ router.post('/service-requests/:id/respond-cancel-escalation', authenticateAdmin
           },
         }
       );
+
+      broadcastNotification({
+        type: 'escalation_cancel_approved',
+        title: '✅ Escalation Cancellation Approved',
+        message: `Admin approved cancellation for job #${request.trackingId}. Ticket is now closed.`,
+        link: '/services',
+        data: { trackingId: request.trackingId }
+      }).catch(() => {});
+
       res.json({ message: 'Cancellation request approved by Admin. Job closed.' });
     } else {
       await db.collection('service_requests').updateOne(
@@ -1686,6 +1934,15 @@ router.post('/service-requests/:id/respond-cancel-escalation', authenticateAdmin
           },
         }
       );
+
+      broadcastNotification({
+        type: 'escalation_cancel_denied',
+        title: '❌ Escalation Cancellation Denied',
+        message: `Admin denied cancellation for job #${request.trackingId}. Job remains active.`,
+        link: '/services',
+        data: { trackingId: request.trackingId }
+      }).catch(() => {});
+
       res.json({ message: 'Cancellation request denied by Admin. Job remains active.' });
     }
   } catch (error) {
@@ -1719,6 +1976,9 @@ router.post('/service-requests/:id/mark-paid-admin', authenticateAdmin, async (r
         $set: {
           paymentStatus: newPaymentStatus,
           paidAt: isPaid ? new Date() : null,
+          paidBy: isPaid ? { id: (req.user?.id || 'admin'), fullName: (req.user?.fullName || req.user?.username || 'Admin HQ') } : null,
+          'escalation.paymentChain.customerPaid': isPaid,
+          'escalation.paymentChain.customerPaidAt': isPaid ? new Date() : null,
           'escalation.paymentChain.partnerBPayAdminStatus': isPaid ? 'confirmed' : 'unpaid',
           'escalation.paymentChain.adminPayPartnerAStatus': isPaid ? 'confirmed' : 'unpaid',
           'escalation.paymentChain.settledByAdminAt': isPaid ? new Date() : null,
@@ -1726,6 +1986,14 @@ router.post('/service-requests/:id/mark-paid-admin', authenticateAdmin, async (r
         },
       }
     );
+
+    broadcastNotification({
+      type: 'payment',
+      title: isPaid ? '💳 Payment Settled by Admin' : '💳 Payment Marked Unpaid',
+      message: `Admin ${isPaid ? 'marked as paid & settled payouts for' : 'reverted payment for'} job #${request.trackingId}`,
+      link: '/services',
+      data: { trackingId: request.trackingId, isPaid }
+    }).catch(() => {});
 
     res.json({
       message: isPaid

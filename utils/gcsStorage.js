@@ -171,6 +171,97 @@ function createWriteStream(destPath, contentType) {
   });
 }
 
+let storageCache = {
+  data: null,
+  timestamp: 0,
+};
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes cache
+
+function formatBytes(bytes, decimals = 2) {
+  if (!bytes || bytes === 0) return '0 B';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+/**
+ * Get total file size, file count, and folder breakdown across Google Cloud Storage bucket.
+ * @param {boolean} [forceRefresh=false] - Force bypass cache and query GCS API directly
+ * @returns {Promise<object>} Storage statistics
+ */
+async function getBucketStorageStats(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && storageCache.data && (now - storageCache.timestamp < CACHE_TTL_MS)) {
+    return {
+      ...storageCache.data,
+      cached: true,
+      cachedAt: new Date(storageCache.timestamp).toISOString(),
+    };
+  }
+
+  const [files] = await bucket.getFiles();
+  let totalBytes = 0;
+  const folders = {};
+  const fileList = [];
+
+  for (const file of files) {
+    const size = parseInt(file.metadata?.size || '0', 10);
+    totalBytes += size;
+    const name = file.name;
+    const prefix = name.includes('/') ? name.split('/')[0] : 'root';
+    if (!folders[prefix]) {
+      folders[prefix] = { count: 0, bytes: 0 };
+    }
+    folders[prefix].count += 1;
+    folders[prefix].bytes += size;
+
+    fileList.push({
+      name,
+      size,
+      formattedSize: formatBytes(size),
+      contentType: file.metadata?.contentType || 'application/octet-stream',
+      updated: file.metadata?.updated || null,
+      folder: prefix,
+      publicUrl: `https://storage.googleapis.com/${config.GCS_BUCKET_NAME}/${name}`,
+    });
+  }
+
+  fileList.sort((a, b) => b.size - a.size);
+
+  const folderStats = Object.keys(folders).map((folder) => {
+    const bytes = folders[folder].bytes;
+    const count = folders[folder].count;
+    const percentage = totalBytes > 0 ? ((bytes / totalBytes) * 100).toFixed(1) : 0;
+    return {
+      folder,
+      count,
+      bytes,
+      formattedSize: formatBytes(bytes),
+      percentage: Number(percentage),
+    };
+  }).sort((a, b) => b.bytes - a.bytes);
+
+  const result = {
+    bucketName: config.GCS_BUCKET_NAME,
+    totalBytes,
+    formattedTotalSize: formatBytes(totalBytes),
+    totalFiles: files.length,
+    folders: folderStats,
+    largestFiles: fileList.slice(0, 15),
+    updatedAt: new Date().toISOString(),
+    cached: false,
+  };
+
+  storageCache = {
+    data: result,
+    timestamp: now,
+  };
+
+  return result;
+}
+
 module.exports = {
   uploadFile,
   uploadBuffer,
@@ -182,4 +273,7 @@ module.exports = {
   getSignedUrl,
   extractGcsPath,
   generateFilename,
+  getBucketStorageStats,
+  formatBytes,
 };
+

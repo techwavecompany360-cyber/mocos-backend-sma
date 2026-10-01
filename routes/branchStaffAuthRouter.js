@@ -6,6 +6,7 @@ const connectDB = require('../utils/db');
 const config = require('../config');
 
 const { sendMail } = require('../utils/emailService');
+const { defaultPermissions } = require('./staffPermissionsRouter');
 
 const router = express.Router();
 const JWT_SECRET = config.JWT_SECRET;
@@ -42,9 +43,11 @@ router.post('/login', async (req, res) => {
 
     let isPartner = false;
     let partner = null;
+    let isPartnerUser = false;
+    let partnerUser = null;
 
     if (!staffMember) {
-      // Check in partners collection
+      // Check in partners collection (Business Owners)
       partner = await db.collection('partners').findOne({
         $or: [{ email: input }, { phoneNumber: input }],
       });
@@ -54,13 +57,74 @@ router.post('/login', async (req, res) => {
     }
 
     if (!staffMember && !partner) {
+      // Check in partner_users collection (Partner sub-users)
+      partnerUser = await db.collection('partner_users').findOne({
+        $or: [{ email: input }, { phoneNumber: input }],
+      });
+      if (partnerUser) {
+        isPartnerUser = true;
+      }
+    }
+
+    if (!staffMember && !partner && !isPartnerUser) {
+      // Check in users collection for admin accounts
+      const userAdmin = await db.collection('users').findOne({
+        $or: [{ email: input }, { username: input }],
+        role: 'admin',
+      });
+      if (userAdmin) {
+        staffMember = {
+          _id: userAdmin._id,
+          fullName: userAdmin.fullName || 'System Admin',
+          email: userAdmin.email || userAdmin.username,
+          phoneNumber: userAdmin.phoneNumber || '',
+          password: userAdmin.password,
+          role: 'admin',
+        };
+      }
+    }
+
+    if (!staffMember && !partner && !isPartnerUser) {
       return res.status(401).json({ error: 'Invalid Email/Phone or Password' });
     }
 
-    const targetUser = isPartner ? partner : staffMember;
+    const targetUser = isPartner ? partner : (isPartnerUser ? partnerUser : staffMember);
     const isMatch = await bcrypt.compare(password, targetUser.password);
     if (!isMatch) {
       return res.status(401).json({ error: 'Invalid Email/Phone or Password' });
+    }
+
+    // Check if account has been deactivated
+    if (staffMember && staffMember.role !== 'admin' && staffMember.isActive === false) {
+      return res.status(403).json({ error: 'Your account has been deactivated. Please contact your branch administrator.' });
+    }
+    if (isPartnerUser && partnerUser.isActive === false) {
+      return res.status(403).json({ error: 'Your account has been deactivated. Please contact your business administrator.' });
+    }
+
+    // ── Admin Branch Selection Flow ────────────────────────────────────
+    // If the logged-in user is an admin (role: 'admin'), they must pick
+    // which branch they want to inspect. Return all branches for selection.
+    if (!isPartner && !isPartnerUser && staffMember.role === 'admin') {
+      const branches = await db.collection('branches').find({}).sort({ name: 1 }).toArray();
+      const branchList = branches.map((b) => ({
+        id: b._id.toString(),
+        name: b.name,
+        region: b.region || '',
+        district: b.district || '',
+        ward: b.ward || '',
+        streetName: b.streetName || '',
+        coordinates: b.coordinates || null,
+      }));
+
+      return res.json({
+        requiresBranchSelection: true,
+        adminId: staffMember._id.toString(),
+        adminFullName: staffMember.fullName,
+        adminEmail: staffMember.email,
+        branches: branchList,
+        message: 'Admin credentials verified. Please select a branch to access.',
+      });
     }
 
     let payload;
@@ -75,6 +139,29 @@ router.post('/login', async (req, res) => {
         role: 'Partner',
         branchId: null,
         branchName: partner.businessName || partner.fullName,
+        isOwner: true,
+        permissions: { canManageInventory: true, canPerformSales: true, canManagePurchases: true },
+        isActive: true,
+      };
+    } else if (isPartnerUser) {
+      let partnerDoc = null;
+      if (partnerUser.partnerId && ObjectId.isValid(partnerUser.partnerId)) {
+        partnerDoc = await db.collection('partners').findOne({ _id: new ObjectId(partnerUser.partnerId) });
+      }
+      const bName = partnerDoc ? (partnerDoc.businessName || partnerDoc.fullName) : 'Partner Business';
+      payload = {
+        id: partnerUser._id.toString(),
+        partnerId: partnerUser.partnerId,
+        fullName: partnerUser.fullName,
+        email: partnerUser.email,
+        phoneNumber: partnerUser.phoneNumber || '',
+        role: partnerUser.role, // 'Cashier', 'Receptionist', 'Technician'
+        branchId: null,
+        branchName: bName,
+        partnerName: bName,
+        permissions: partnerUser.permissions || defaultPermissions(partnerUser.role),
+        isActive: partnerUser.isActive !== false,
+        isOwner: false,
       };
     } else {
       let branchName = staffMember.branchName || '';
@@ -88,9 +175,11 @@ router.post('/login', async (req, res) => {
         fullName: staffMember.fullName,
         email: staffMember.email,
         phoneNumber: staffMember.phoneNumber,
-        role: staffMember.role, // 'Receptionist' or 'Technician'
+        role: staffMember.role, // 'Manager', 'Receptionist', 'Cashier', 'Technician'
         branchId: staffMember.branchId,
         branchName,
+        permissions: staffMember.permissions || defaultPermissions(staffMember.role),
+        isActive: staffMember.isActive !== false,
       };
     }
 
@@ -107,11 +196,196 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// POST /api/branch-staff/admin-branch-login
+// Admin selects a branch to view — issues a token scoped to that branch with role 'Admin'
+router.post('/admin-branch-login', async (req, res) => {
+  try {
+    const db = await connectDB();
+    const { emailOrPhone, password, branchId } = req.body;
+
+    if (!emailOrPhone || !password || !branchId) {
+      return res.status(400).json({ error: 'Email, password, and branchId are required' });
+    }
+
+    if (!ObjectId.isValid(branchId)) {
+      return res.status(400).json({ error: 'Invalid branch ID' });
+    }
+
+    const input = emailOrPhone.toLowerCase().trim();
+    let adminStaff = await db.collection('branch_staff').findOne({
+      $or: [{ email: input }, { phoneNumber: input }],
+    });
+
+    if (!adminStaff) {
+      const userAdmin = await db.collection('users').findOne({
+        $or: [{ email: input }, { username: input }],
+        role: 'admin',
+      });
+      if (userAdmin) {
+        adminStaff = {
+          _id: userAdmin._id,
+          fullName: userAdmin.fullName || 'System Admin',
+          email: userAdmin.email || userAdmin.username,
+          phoneNumber: userAdmin.phoneNumber || '',
+          password: userAdmin.password,
+          role: 'admin',
+        };
+      }
+    }
+
+    if (!adminStaff || adminStaff.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin credentials required' });
+    }
+
+    const isMatch = await bcrypt.compare(password, adminStaff.password);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Fetch the selected branch
+    const branch = await db.collection('branches').findOne({ _id: new ObjectId(branchId) });
+    if (!branch) {
+      return res.status(404).json({ error: 'Branch not found' });
+    }
+
+    const payload = {
+      id: adminStaff._id.toString(),
+      fullName: adminStaff.fullName,
+      email: adminStaff.email,
+      phoneNumber: adminStaff.phoneNumber || '',
+      role: 'Admin',           // Distinguishable from 'admin' (system), 'Receptionist', 'Technician'
+      isAdminViewing: true,    // Flag so UI can display admin-specific UI
+      branchId: branch._id.toString(),
+      branchName: branch.name,
+    };
+
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '12h' });
+
+    res.json({
+      message: `Admin access granted to branch: ${branch.name}`,
+      token,
+      staff: {
+        ...payload,
+        branchDetails: {
+          name: branch.name,
+          description: branch.description || '',
+          region: branch.region || '',
+          district: branch.district || '',
+          ward: branch.ward || '',
+          streetName: branch.streetName || '',
+          coordinates: branch.coordinates || null,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('[Admin Branch Login] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/branch-staff/admin-switch-branch
+// Switch branch on the fly for an already authenticated admin session
+router.post('/admin-switch-branch', authenticateBranchStaff, async (req, res) => {
+  try {
+    const db = await connectDB();
+    const { branchId } = req.body;
+
+    if (!branchId || !ObjectId.isValid(branchId)) {
+      return res.status(400).json({ error: 'Valid branchId is required' });
+    }
+
+    if (req.staff.role !== 'Admin' && !req.staff.isAdminViewing) {
+      return res.status(403).json({ error: 'Only administrators can switch branches' });
+    }
+
+    const branch = await db.collection('branches').findOne({ _id: new ObjectId(branchId) });
+    if (!branch) {
+      return res.status(404).json({ error: 'Branch not found' });
+    }
+
+    const payload = {
+      id: req.staff.id,
+      fullName: req.staff.fullName,
+      email: req.staff.email,
+      phoneNumber: req.staff.phoneNumber || '',
+      role: 'Admin',
+      isAdminViewing: true,
+      branchId: branch._id.toString(),
+      branchName: branch.name,
+    };
+
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '12h' });
+
+    res.json({
+      message: `Switched to branch: ${branch.name}`,
+      token,
+      staff: {
+        ...payload,
+        branchDetails: {
+          name: branch.name,
+          description: branch.description || '',
+          region: branch.region || '',
+          district: branch.district || '',
+          ward: branch.ward || '',
+          streetName: branch.streetName || '',
+          coordinates: branch.coordinates || null,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('[Admin Switch Branch] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET /api/branch-staff/me - Get logged-in staff/partner profile & branch/location info
 router.get('/me', authenticateBranchStaff, async (req, res) => {
   try {
     const db = await connectDB();
     if (!ObjectId.isValid(req.staff.id)) return res.status(400).json({ error: 'Invalid staff/partner ID' });
+
+    // Admin viewing a branch — reconstruct from JWT + live branch data
+    if (req.staff.role === 'Admin' && req.staff.isAdminViewing) {
+      let adminStaff = await db.collection('branch_staff').findOne({ _id: new ObjectId(req.staff.id) });
+      if (!adminStaff) {
+        adminStaff = await db.collection('users').findOne({ _id: new ObjectId(req.staff.id) });
+      }
+      let branch = null;
+      if (req.staff.branchId && ObjectId.isValid(req.staff.branchId)) {
+        branch = await db.collection('branches').findOne({ _id: new ObjectId(req.staff.branchId) });
+      }
+      const allBranches = await db.collection('branches').find({}).sort({ name: 1 }).toArray();
+
+      return res.json({
+        id: req.staff.id,
+        fullName: adminStaff ? adminStaff.fullName : req.staff.fullName,
+        email: adminStaff ? adminStaff.email : req.staff.email,
+        phoneNumber: adminStaff ? adminStaff.phoneNumber : req.staff.phoneNumber,
+        role: 'Admin',
+        isAdminViewing: true,
+        branchId: req.staff.branchId,
+        branchName: branch ? branch.name : req.staff.branchName,
+        availableBranches: allBranches.map((b) => ({
+          id: b._id.toString(),
+          name: b.name,
+          region: b.region || '',
+          district: b.district || '',
+          ward: b.ward || '',
+          streetName: b.streetName || '',
+        })),
+        branchDetails: branch
+          ? {
+              name: branch.name,
+              description: branch.description || '',
+              region: branch.region || '',
+              district: branch.district || '',
+              ward: branch.ward || '',
+              streetName: branch.streetName || '',
+              coordinates: branch.coordinates || null,
+            }
+          : null,
+      });
+    }
 
     if (req.staff.role === 'Partner') {
       const partner = await db.collection('partners').findOne({ _id: new ObjectId(req.staff.id) });
@@ -127,6 +401,8 @@ router.get('/me', authenticateBranchStaff, async (req, res) => {
         role: 'Partner',
         branchId: null,
         branchName: partner.businessName || partner.fullName,
+        isOwner: true,
+        permissions: { canManageInventory: true, canPerformSales: true, canManagePurchases: true },
         branchDetails: {
           name: partner.businessName || partner.fullName,
           description: 'Partner Location',
@@ -139,8 +415,43 @@ router.get('/me', authenticateBranchStaff, async (req, res) => {
       });
     }
 
-    const staff = await db.collection('branch_staff').findOne({ _id: new ObjectId(req.staff.id) });
-    if (!staff) return res.status(404).json({ error: 'Staff profile not found' });
+    let staff = await db.collection('branch_staff').findOne({ _id: new ObjectId(req.staff.id) });
+    if (!staff) {
+      // Check partner_users
+      const pUser = await db.collection('partner_users').findOne({ _id: new ObjectId(req.staff.id) });
+      if (pUser) {
+        let partner = null;
+        if (pUser.partnerId && ObjectId.isValid(pUser.partnerId)) {
+          partner = await db.collection('partners').findOne({ _id: new ObjectId(pUser.partnerId) });
+        }
+        return res.json({
+          id: pUser._id.toString(),
+          fullName: pUser.fullName,
+          email: pUser.email,
+          phoneNumber: pUser.phoneNumber,
+          role: pUser.role,
+          partnerId: pUser.partnerId,
+          partnerName: partner ? (partner.businessName || partner.fullName) : 'Partner Business',
+          branchId: null,
+          branchName: partner ? (partner.businessName || partner.fullName) : 'Partner Business',
+          permissions: pUser.permissions || defaultPermissions(pUser.role),
+          isActive: pUser.isActive !== false,
+          isOwner: false,
+          branchDetails: partner
+            ? {
+                name: partner.businessName || partner.fullName,
+                description: 'Partner Location',
+                region: partner.region,
+                district: partner.district,
+                ward: partner.ward,
+                streetName: partner.streetName,
+                coordinates: partner.coordinates,
+              }
+            : null,
+        });
+      }
+      return res.status(404).json({ error: 'Staff profile not found' });
+    }
 
     let branch = null;
     if (staff.branchId && ObjectId.isValid(staff.branchId)) {
@@ -155,6 +466,8 @@ router.get('/me', authenticateBranchStaff, async (req, res) => {
       role: staff.role,
       branchId: staff.branchId,
       branchName: branch ? branch.name : staff.branchName,
+      permissions: staff.permissions || defaultPermissions(staff.role),
+      isActive: staff.isActive !== false,
       branchDetails: branch
         ? {
             name: branch.name,
@@ -187,16 +500,29 @@ router.post('/change-password', authenticateBranchStaff, async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 6 characters long' });
     }
 
-    const staff = await db.collection('branch_staff').findOne({ _id: new ObjectId(req.staff.id) });
-    if (!staff) return res.status(404).json({ error: 'Staff profile not found' });
+    let collectionName = 'branch_staff';
+    let user = await db.collection('branch_staff').findOne({ _id: new ObjectId(req.staff.id) });
+    if (!user) {
+      user = await db.collection('partner_users').findOne({ _id: new ObjectId(req.staff.id) });
+      if (user) collectionName = 'partner_users';
+    }
+    if (!user) {
+      user = await db.collection('partners').findOne({ _id: new ObjectId(req.staff.id) });
+      if (user) collectionName = 'partners';
+    }
+    if (!user) {
+      user = await db.collection('users').findOne({ _id: new ObjectId(req.staff.id) });
+      if (user) collectionName = 'users';
+    }
+    if (!user) return res.status(404).json({ error: 'User profile not found' });
 
-    const isMatch = await bcrypt.compare(currentPassword, staff.password);
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
     if (!isMatch) {
       return res.status(400).json({ error: 'Current password is incorrect' });
     }
 
     const newHashedPassword = await bcrypt.hash(newPassword, 10);
-    await db.collection('branch_staff').updateOne(
+    await db.collection(collectionName).updateOne(
       { _id: new ObjectId(req.staff.id) },
       { $set: { password: newHashedPassword, updatedAt: new Date() } }
     );
@@ -219,14 +545,15 @@ router.post('/forgot-password', async (req, res) => {
     const inputEmail = email.trim().toLowerCase();
     const db = await connectDB();
 
-    // Check if user exists in users, branch_staff, or partners
-    const [userRecord, staffRecord, partnerRecord] = await Promise.all([
+    // Check if user exists in users, branch_staff, partners, or partner_users
+    const [userRecord, staffRecord, partnerRecord, partnerUserRecord] = await Promise.all([
       db.collection('users').findOne({ $or: [{ email: inputEmail }, { username: inputEmail }] }),
       db.collection('branch_staff').findOne({ email: inputEmail }),
-      db.collection('partners').findOne({ email: inputEmail })
+      db.collection('partners').findOne({ email: inputEmail }),
+      db.collection('partner_users').findOne({ email: inputEmail }),
     ]);
 
-    const targetAccount = userRecord || staffRecord || partnerRecord;
+    const targetAccount = userRecord || staffRecord || partnerRecord || partnerUserRecord;
 
     if (!targetAccount) {
       return res.status(404).json({ error: 'No account found registered with this email address.' });
@@ -360,6 +687,10 @@ router.post('/reset-password-otp', async (req, res) => {
         { $set: { password: hashedPassword, updatedAt: new Date() } }
       ),
       db.collection('partners').updateMany(
+        { email: inputEmail },
+        { $set: { password: hashedPassword, updatedAt: new Date() } }
+      ),
+      db.collection('partner_users').updateMany(
         { email: inputEmail },
         { $set: { password: hashedPassword, updatedAt: new Date() } }
       )
